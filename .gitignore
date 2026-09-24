@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Data — regenerate with `python -m data.download && python -m data.prepare`
+data/raw/
+data/processed/
+.cache/
+
+# Keep figures: the README renders them
+!figures/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

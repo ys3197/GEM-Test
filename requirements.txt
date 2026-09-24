@@ -1,0 +1,10 @@
+# Data pipeline (M0)
+huggingface_hub>=0.25
+pandas>=2.2
+pyarrow>=15.0
+numpy>=1.26
+matplotlib>=3.8
+
+# Models (M1+) — install the CUDA build separately:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# torch>=2.4

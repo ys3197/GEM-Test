@@ -293,54 +293,55 @@ precision — and the winner flips. **No single run can be read as a result.**
 `analysis/transfer_table.py` reports mean and spread and prints `resolved? no` when a
 gap falls inside the noise.
 
-### 4.2 Six arms, `Software`, `k = 0`
+### 4.2 Six arms, `Software`, `k = 0` — now complete at 3 seeds (42, 1337, 7)
 
 4 epochs, selection on `valid`, reported once on `eval`. Teacher alone on `eval`:
-**NE 0.5574, AUC 0.9260**.
+**NE 0.5574**. `analysis/transfer_table.py` output:
 
-| arm | trainable dense | seed 42 | seed 1337 | AUC (s42) | same direction? |
-|---|---|---|---|---|---|
-| **A** no transfer | 91,333 | 0.5966 | 0.5438 | 0.9127 | baseline |
-| **B** naive KD | 91,333 | 0.5690 ✓ | 0.5527 ✗ | 0.9258 | **no** |
-| **C** KD + Student Adapter | 92,311 | **0.7767** | **0.7613** | 0.9276 | yes, consistently worse |
-| **D** parameter sharing | 91,333 | 0.5551 ✓ | 0.4749 ✓ | 0.9294 | yes, consistently better |
-| **E** representation transfer | 165,253 | 0.6194 | — | 0.9303 | n=1 |
-| **E'** shuffled control | 165,253 | 0.5519 | — | 0.9213 | n=1 |
+| arm | n | NE mean | spread | AUC | vs A | resolved? | params |
+|---|---|---|---|---|---|---|---|
+| **A** no transfer | 3 | 0.5883 | 0.0808 | 0.9172 | — | — | 91,333 |
+| **B** naive KD | 3 | 0.5658 | 0.0229 | 0.9270 | −3.83% | no | 91,333 |
+| **C** KD + Student Adapter | 3 | **0.7763** | 0.0296 | 0.9278 | **+31.95%** | **yes** | 92,311 |
+| **D** parameter sharing | 3 | 0.5277 | 0.0802 | 0.9338 | −10.31% | no | 91,333 |
+| **E** representation transfer | 3 | 0.6357 | 0.0844 | 0.9299 | +8.05% | no | 165,253 |
+| **E'** shuffled control | 3 | 0.5677 | 0.0253 | 0.9190 | −3.50% | no | 165,253 |
 
-Valid NE for reference (selection basis): seed 42 — A 0.4757, B 0.4184, C 0.5286,
-D 0.4315, E 0.4887, E' 0.4804. Seed 1337 — A 0.4771, B 0.4136, C 0.5142, D 0.4078.
+With three seeds instead of one or two, only **C's penalty is statistically resolved**
+— every other arm's gap vs A still sits inside the seed-noise band (§4.1). This
+sharpens, not changes, the 2-seed reading below: D's apparent −10% edge and B's −4%
+edge are not yet distinguishable from noise; C's +32% penalty is.
 
 **Readings, descending confidence:**
 
-1. **C is 30% worse than no transfer, consistently, and it is not a selection
-   artefact** — the same ordering holds on `valid`. Hypothesis: the adapter turns
-   distillation from a regulariser into an *overfitting amplifier*. It fits ground
-   truth on the student's own training window and fits it better than the student does
-   (`adapter_fit` 0.096 against `task` 0.15), so the distillation target becomes a
-   high-fidelity copy of the training labels. At `k = 0` this is all cost — the teacher
-   is not stale, so there is nothing to correct and the training labels are just
-   relayed twice.
+1. **C is 32% worse than no transfer, and — with 3 seeds — this is now the one
+   resolved result in the table**, not just a same-direction pattern. Hypothesis: the
+   adapter turns distillation from a regulariser into an *overfitting amplifier*. It
+   fits ground truth on the student's own training window and fits it better than the
+   student does (`adapter_fit` 0.096 against `task` 0.15), so the distillation target
+   becomes a high-fidelity copy of the training labels. At `k = 0` this is all cost —
+   the teacher is not stale, so there is nothing to correct and the training labels are
+   just relayed twice.
 
    **This is not evidence against claim B.** The claim is that C's advantage *widens
    with `k`*, so C at its worst when the teacher is current is the baseline the sweep
    needs. What it does expose is a question the GEM post leaves open — it says the
    adapter uses "the most recent ground-truth data", and if that is the student's own
-   training window the amplification is structural. **Untested.** See §6.
+   training window the amplification is structural. **Untested — this is now the
+   single open blocker before M4.** See §6.
 
-2. **E loses to its own shuffled control** (0.6194 against 0.5519). At n=1 nothing is
-   resolved, but there is no evidence E transfers anything useful, and its extra 74k
-   parameters are unearned. This is why the control was added: without it, 0.6194 reads
-   as "E is slightly behind" rather than "E cannot beat its own noise".
+2. **E does not clearly beat its own shuffled control** (0.6357 vs 0.5677, both inside
+   noise). There is still no resolved evidence E transfers anything useful, and its
+   extra 74k parameters remain unearned.
 
-3. **D is the only arm consistent in direction across both seeds**, and the cheapest —
-   copy four quantile-bucket embedding tables and freeze them. Matches the reason those
-   four were the only shared vocabularies.
+3. **D and B's apparent edges over A did not hold up at n=3** — both are unresolved.
+   Worth re-checking at a larger seed count before treating parameter sharing as
+   "the cheap win"; the 2-seed read was premature.
 
 **NE and AUC disagree**, which matters because M4 rests on it: C keeps a respectable
-AUC (0.9276) while its NE collapses (0.7767); A has the worst AUC (0.9127) and a
-middling NE. C's *ranking* is intact and its *calibration* is what broke — the
-calibration-before-ranking split claim B's premise depends on, appearing as a
-measurement rather than an argument.
+AUC (0.9278) while its NE collapses (0.7763); the *ranking* stays intact and the
+*calibration* is what broke — the calibration-before-ranking split claim B's premise
+depends on, appearing as a measurement rather than an argument.
 
 ### 4.3 M1 smoke test (claim A, for reference)
 
@@ -357,39 +358,22 @@ and interleaved is slightly worse and 60% slower, which is the direction M0 pred
 
 ---
 
-## 5. What was running when this was written
+## 5. M3 is complete
 
-A background run of 6 arms × 3 seeds was **stopped by the system while the session was
-idle, because the machine was low on memory**. Not a failure of the run, and nothing in
-it to debug.
-
-State at the stop:
+All three seeds (42, 1337, 7) finished cleanly on 2026-09-25; see §4.2 for the final
+table. The earlier interruption (system killed a background run for memory while the
+session was idle, mid-seed-1337) cost nothing — seeds 1337 and 7 were simply rerun
+from scratch, since per-seed logs are independent.
 
 ```
-seed 42     complete   -> runs/transfer/m3_seed42.json written
-seed 1337   A,B,C,D done, E in progress -> no JSON (log only: runs/m3_seed1337.log)
-seed 7      never started
+runs/transfer/m3_seed42.json
+runs/transfer/m3_seed1337.json
+runs/transfer/m3_seed7.json
 ```
-
-Seed 1337's numbers in §4.2 come from the log, not the JSON. **To finish, the missing
-work is seed 1337's E and E', plus all of seed 7** — per-seed logs are independent, so
-re-running seeds 1337 and 7 from scratch is simplest.
 
 ---
 
 ## 6. Open questions and next steps
-
-**Immediate — finish M3's seeds** (~20 min, GPU; teacher is cached so it loads):
-
-```bash
-cd E:/projects/GEM-Test
-for s in 1337 7; do
-  .venv/Scripts/python.exe -u train_transfer.py --domain Software --k 0 \
-    --teacher-epochs 2 --student-epochs 4 --student-seed $s --tag m3_seed$s \
-    > runs/m3_seed$s.log 2>&1 || { echo "seed $s FAILED"; tail -30 runs/m3_seed$s.log; break; }
-done
-.venv/Scripts/python.exe -m analysis.transfer_table
-```
 
 **Untested hypothesis worth resolving before M4 — does the adapter need held-out
 data?** §4.2 reading 1 says C's damage comes from the adapter fitting the student's own

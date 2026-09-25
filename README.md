@@ -12,7 +12,10 @@ one kind depends on scale:
 | **Mechanism claims** | interleaving beats pooling; a Student Adapter beats naive distillation; performance is log-linear in compute | **Yes** — these are claims about *proportions*, not absolute size |
 | **Infrastructure claims** | 5D parallelism, MXFP8 kernels, SM-free collectives | **No, and deliberately not attempted** — the problems they solve (cross-zone bandwidth, thousand-GPU straggler skew) do not exist on one GPU |
 
-So this repo tests the first kind and says so plainly. Negative results count.
+So this repo tests the first kind and says so plainly. Negative results count, and so
+does "not resolved" — the seed noise on this data is ~3% of NE, the same size as the
+effects, so every number is reported with its spread and a single run is never read as
+a result.
 
 ---
 
@@ -21,8 +24,13 @@ So this repo tests the first kind and says so plainly. Negative results count.
 | | Claim | How it is tested | Status |
 |---|---|---|---|
 | **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | **deferred** — see M1 |
-| **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Age the teacher deliberately: it trains on a sliding 730-day window ending at `T − k`, the student always on `[T − 365, T]`, both scored on `[T, T + 180]`. Sweep `k ∈ {0, 90, 365, 730, 1095}` days | M4 |
+| **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Age the teacher deliberately: it trains on a sliding 730-day window ending at `T − k`, the student always on `[T − 365, T]`, both scored on `[T, T + 180]`. Sweep `k ∈ {0, 90, 365, 730, 1095}` days | M3 built, **M4 pending** |
 | **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 |
+
+What M4 still needs, stated plainly: the `k` sweep across all four domains at three or
+more seeds per cell. M3's single-seed pass is groundwork — it established the windows,
+the controls, and the noise floor, and it found one effect (arm C) large enough to
+survive that floor.
 
 **B is the centre of gravity**, and the reason claim A is deferred rather than next. A and
 C have close analogues in the public literature; the Student Adapter does not, and it is
@@ -286,11 +294,74 @@ would make arm D unimplementable, and the failure mode is that it silently degen
 into arm A while still being labelled parameter sharing. `share_parameters` raises rather
 than skipping, for the same reason.
 
+### First numbers, and what they do not yet support
+
+`Software`, `k = 0`, 4 epochs with selection on `valid`, reported once on `eval`.
+**This is not a table anyone can draw a conclusion from**: seed 42 is complete, seed
+1337 stopped after arm D, and seed 7 never ran. Both seeds are shown rather than
+averaged, because averaging two runs would hide exactly the disagreement that matters.
+
+Teacher alone on `eval`: **NE 0.5574, AUC 0.9260**.
+
+| arm | trainable dense | seed 42 | seed 1337 | same direction? |
+|---|---|---|---|---|
+| **A** no transfer | 91,333 | 0.5966 | 0.5438 | baseline |
+| **B** naive KD | 91,333 | 0.5690 ✓ | 0.5527 ✗ | **no** |
+| **C** KD + Student Adapter | 92,311 | **0.7767** | **0.7613** | yes, consistently worse |
+| **D** parameter sharing | 91,333 | 0.5551 ✓ | 0.4749 ✓ | yes, consistently better |
+| **E** representation transfer | 165,253 | 0.6194 | — | n=1 |
+| **E'** shuffled control | 165,253 | 0.5519 | — | n=1 |
+
+Three readings, in descending order of how much weight they can carry.
+
+**1. C is much worse, consistently, and it is not a selection artefact.** +30% NE
+against A, where A's own spread across the two seeds is 0.053 and C sits 0.20 above
+it. The same ordering holds on `valid` (C 0.51–0.53 against A 0.476–0.477), so the
+epoch choice is not doing it.
+
+The hypothesis is that **the adapter turns distillation from a regulariser into an
+overfitting amplifier.** It fits ground truth on the student's own training window,
+and fits it better than the student does (`adapter_fit` 0.096 against `task` 0.15).
+The distillation target therefore becomes a high-fidelity copy of the training
+labels, and the student is pushed to memorise that window harder than arm A ever is.
+At `k = 0` this is all cost: the teacher is not stale, so there is nothing for the
+adapter to correct, and it only relays the training labels a second time.
+
+**This is not evidence against claim B.** The claim is that C's advantage *widens with
+`k`*, so C being at its worst when the teacher is current is the baseline the sweep
+needs. What it does expose is a design question the GEM post leaves open: it says the
+adapter uses "the most recent ground-truth data", and if that is the student's own
+training window then this amplification is structural. Whether the adapter needs its
+own held-out slice is untested here.
+
+**2. E loses to its own shuffled control** (0.6194 against 0.5519). The real teacher
+representation does worse than the same representation with the batch order permuted.
+At n=1 that resolves nothing, but there is **no evidence that E transfers anything
+useful**, and its extra 74k parameters are not earning their place. This is what the
+control was for: without it, 0.6194 reads as "E is slightly behind" rather than "E
+cannot beat its own noise".
+
+**3. D is the only arm consistent in direction across both seeds**, and the cheapest
+— copy four quantile-bucket embedding tables and freeze them. That matches the reason
+those four vocabularies were the only ones shared: `price_bucket=7` means the same
+thing in every domain, and offset ids do not.
+
+Worth noting separately, because M4 is built on it: **NE and AUC disagree here.** C
+has a respectable AUC of 0.9276 and an NE of 0.7767; A has the worst AUC at 0.9127
+and a middling NE. C's *ranking* is intact and its *calibration* is what collapsed —
+the exact split claim B's premise depends on, showing up in real measurements rather
+than as an argument.
+
 ```bash
 python -m data.transfer_data                       # reproduces the window table above
-python train_transfer.py --domain Software --k 0
+python train_transfer.py --domain Software --k 0 --student-seed 42
+python -m analysis.transfer_table                  # mean, spread, and resolved?/no
 python train_transfer.py --all-domains --k 0 90 365 730 1095    # the M4 sweep
 ```
+
+Every gap above is inside or near the seed noise except C's, so `transfer_table`
+prints `resolved? no` for the rest by design. Reading a single run as a result is the
+one mistake this milestone is set up to prevent.
 
 ---
 

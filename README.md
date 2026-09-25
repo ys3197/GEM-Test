@@ -20,7 +20,7 @@ So this repo tests the first kind and says so plainly. Negative results count.
 
 | | Claim | How it is tested | Status |
 |---|---|---|---|
-| **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | M2 |
+| **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | M2 — **at risk**, see below |
 | **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Deliberately train the teacher on data up to `T − k`, the student on `[T − k, T]`, sweep `k ∈ {0, 3, 7, 14, 30}` days | M4 |
 | **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 |
 
@@ -98,6 +98,48 @@ not where the compute goes.** Picking `max_len` deliberately is. The repo uses `
 
 ---
 
+## M1 — the model runs
+
+Both structures claim A compares are built, assembled behind one config, and
+training converges on a single 8 GB GPU.
+
+```
+Software, 150k positions, 2 epochs, untuned
+
+  pooled        NE 0.5187   AUC 0.9322   36 s/epoch   0.60M dense params
+  interleaved   NE 0.5262   AUC 0.9224   56 s/epoch   0.67M dense params
+```
+
+This is a smoke test, not the experiment. What it establishes is narrower: the
+pipeline learns (NE well below 1, AUC in a sane range for CTR), and both
+variants overfit by epoch 2, so the real sweep needs early stopping and more
+data.
+
+**Normalized entropy** is the headline metric because raw log loss is not
+comparable across these runs — the positive rate is fixed by the negative
+sampling ratio, which differs between experiments. Dividing by the entropy of
+the base rate removes that. AUC sits beside it on purpose: AUC is rank-only,
+NE also responds to calibration, and M4 depends on exactly that split, since a
+stale teacher degrades a student's calibration well before its ranking.
+
+Two things must be fixed before the claim-A comparison means anything:
+
+- **The variants differ by 12% in dense parameters.** Compared as they stand,
+  the result would measure capacity rather than structure.
+- **The interleaved variant is currently slightly worse and 60% slower**, which
+  is the direction M0 predicted: at a median of 7 events per user, "preserving
+  the full sequence" has little to preserve. Whether that is a fact about this
+  dataset or about the structure is precisely what M2 has to separate — and if
+  it cannot, that is a finding about what public data can support, reported as
+  such.
+
+```bash
+python train.py --domain Software --variant pooled --epochs 2
+python train.py --domain Software --variant interleaved --scale 0.5
+```
+
+---
+
 ## Setup
 
 ```bash
@@ -108,7 +150,10 @@ pip install -r requirements.txt
 python -m data.download           # ~7.9 GB across four domains
 python -m data.probe              # density check — run this before trusting a domain
 python -m data.prepare            # k-core, temporal ordering, parquet
+python -m data.features           # vocabularies and quantile buckets
 python -m analysis.padding_waste  # reproduces the figure above
+
+pytest tests/ -q                  # 17 guardrails; skips cleanly without data
 ```
 
 Models (M1 onward) additionally need a CUDA build of PyTorch:
@@ -130,8 +175,18 @@ data/
   download.py               fetch raw jsonl from HuggingFace (no loading script, by choice)
   probe.py                  density and k-core survival, per domain
   prepare.py                k-core filter, temporal sort, parquet output
+  features.py               categorical encoding: vocabularies and quantile buckets
+  dataset.py                causal sample construction, jagged batching
+models/
+  embeddings.py             shared-width field tables, sequence masking
+  wukong.py                 stacked factorization machines (non-sequence tower)
+  sequence.py               event model + candidate-keyed attention pooling, O(M*N)
+  interformer.py            the two structures claim A compares
+  gem.py                    assembly; one config drives every width
+train.py                    training loop, normalized entropy, AUC
 analysis/
   padding_waste.py          M0 result
+tests/                      causality and architecture guardrails — no GPU needed
 figures/                    committed — the README renders them
 ```
 

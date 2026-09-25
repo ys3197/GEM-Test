@@ -35,9 +35,20 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import MAX_SEQ_LEN, PROCESSED_DIR, RANDOM_SEED  # noqa: E402
+from config import (  # noqa: E402
+    MAX_SEQ_LEN,
+    PROCESSED_DIR,
+    RANDOM_SEED,
+    TIME_GAP_BUCKETS_DAYS,
+)
 
 PAD = 0
+N_RESERVED = 3
+
+_NS_PER_DAY = 86_400_000_000_000
+_GAP_EDGES = np.asarray(TIME_GAP_BUCKETS_DAYS, dtype=np.float64)
+# 桶数 = 边界数 + 1，再加保留位（0 号留给 PAD）
+N_TIME_BUCKETS = len(_GAP_EDGES) + 1 + N_RESERVED
 
 ITEM_FEATURE_COLUMNS = ["store", "category", "price_bucket",
                         "rating_bucket", "popularity_bucket"]
@@ -57,9 +68,15 @@ class DomainData:
     n_users: int
     n_items: int
 
-    def history(self, user_idx: int, pos: int, max_len: int) -> np.ndarray:
+    def history(self, user_idx: int, pos: int,
+                max_len: int) -> tuple[np.ndarray, np.ndarray]:
         """
         The user's items strictly before this event, capped to the most recent.
+
+        Returns (items, time_gap_buckets). The gap is measured from each history
+        event to the candidate, so position in the array carries order and the
+        bucket carries recency — the sequence model then needs no positional
+        encoding of its own.
 
         The cut uses `hist_end` rather than the position itself: events sharing
         the candidate's exact timestamp are excluded. At prediction time you do
@@ -68,7 +85,11 @@ class DomainData:
         """
         start = self.user_offsets[user_idx]
         end = self.hist_end[start + pos]
-        return self.user_items[max(start, end - max_len):end]
+        lo = max(start, end - max_len)
+        items = self.user_items[lo:end]
+        gap_days = (self.user_ts[start + pos] - self.user_ts[lo:end]) / _NS_PER_DAY
+        gaps = np.searchsorted(_GAP_EDGES, gap_days) + N_RESERVED
+        return items, gaps.astype(np.int64)
 
 
 def load_domain(domain: str) -> DomainData:
@@ -199,7 +220,7 @@ class InteractionDataset(Dataset):
         row, slot = divmod(idx, 1 + self.n_negatives)
         user_idx, pos = self.positions[row]
 
-        hist = self.data.history(user_idx, pos, self.max_seq_len)
+        hist, gaps = self.data.history(user_idx, pos, self.max_seq_len)
         true_item = self.data.user_items[self.data.user_offsets[user_idx] + pos]
 
         if slot == 0:
@@ -211,6 +232,7 @@ class InteractionDataset(Dataset):
             "user": int(user_idx) + 3,          # 对齐词表里的保留位偏移
             "item": int(item),
             "hist": torch.from_numpy(hist.astype(np.int64)),
+            "hist_gap": torch.from_numpy(gaps),
             "label": label,
         }
 
@@ -238,13 +260,17 @@ def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
     max_len = int(lengths.max())
 
     hist = torch.full((len(batch), max_len), PAD, dtype=torch.long)
+    gaps = torch.full((len(batch), max_len), PAD, dtype=torch.long)
     for i, b in enumerate(batch):
-        hist[i, : len(b["hist"])] = b["hist"]
+        n = len(b["hist"])
+        hist[i, :n] = b["hist"]
+        gaps[i, :n] = b["hist_gap"]
 
     return {
         "user": torch.tensor([b["user"] for b in batch], dtype=torch.long),
         "item": torch.tensor([b["item"] for b in batch], dtype=torch.long),
         "hist": hist,
+        "hist_gap": gaps,
         "hist_len": lengths,
         "label": torch.tensor([b["label"] for b in batch], dtype=torch.float32),
     }

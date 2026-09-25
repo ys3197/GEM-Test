@@ -129,3 +129,61 @@ def test_positive_rate_matches_negative_sampling_ratio(data, splits):
     ds = InteractionDataset(data, splits["train"][:1000], n_negatives=4, seed=5)
     batch = collate([ds[i] for i in range(1000)])
     assert batch["label"].mean() == pytest.approx(0.2, abs=0.02)
+
+
+# ── 池化数据（M3 的地基）──────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def pooled():
+    from data.pooled import load_pooled
+    from config import DOMAINS
+    have = [d for d in DOMAINS if (PROCESSED_DIR / d / "vocab.json").exists()]
+    if len(have) < 2:
+        pytest.skip("need at least two prepared domains")
+    return load_pooled(have)
+
+
+def test_pooled_ids_do_not_collide_across_domains(pooled):
+    """
+    Items are offset per domain because the measured overlap is zero: Amazon
+    categories partition ASINs. If ranges overlapped, two unrelated products
+    would share an embedding.
+    """
+    ranges = []
+    for i in range(pooled.n_domains):
+        mask = pooled.domain_of_event == i
+        ranges.append((pooled.user_items[mask].min(), pooled.user_items[mask].max()))
+    for (_, hi), (lo, _) in zip(ranges, ranges[1:]):
+        assert hi < lo
+
+
+def test_every_user_belongs_to_one_domain(pooled):
+    rng = np.random.default_rng(0)
+    for u in rng.integers(0, pooled.n_users, 2000):
+        start, stop = pooled.user_offsets[u], pooled.user_offsets[u + 1]
+        if stop > start:
+            assert len(np.unique(pooled.domain_of_event[start:stop])) == 1
+
+
+def test_pooling_preserves_each_domains_sample_count(pooled):
+    """Pooling must add data, never silently drop or duplicate any."""
+    from data.pooled import domain_positions
+
+    boundary = pd.Timestamp("2021-01-01")
+    pooled_splits = temporal_split(pooled, boundary)
+
+    for name in pooled.domain_names:
+        solo = temporal_split(load_domain(name), boundary)
+        assert len(domain_positions(pooled, pooled_splits["train"], name)) == \
+               len(solo["train"])
+
+
+def test_causality_survives_pooling(pooled):
+    splits = temporal_split(pooled, pd.Timestamp("2021-01-01"))
+    rng = np.random.default_rng(3)
+    for user_idx, pos in splits["train"][rng.integers(len(splits["train"]), size=3000)]:
+        start = pooled.user_offsets[user_idx]
+        end = pooled.hist_end[start + pos]
+        assert end > start
+        assert pooled.user_ts[max(start, end - MAX_SEQ_LEN):end].max() < \
+               pooled.user_ts[start + pos]

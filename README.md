@@ -28,9 +28,10 @@ a result.
 | **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 |
 
 What M4 still needs, stated plainly: the `k` sweep across all four domains at three or
-more seeds per cell. M3's single-seed pass is groundwork — it established the windows,
-the controls, and the noise floor, and it found one effect (arm C) large enough to
-survive that floor.
+more seeds per cell. M3's three-seed pass on `Software` at `k = 0` is groundwork — it
+established the windows, the controls, and the noise floor, and it found one effect
+(arm C) large enough to survive that floor while overturning two others that had looked
+real at two seeds.
 
 **B is the centre of gravity**, and the reason claim A is deferred rather than next. A and
 C have close analogues in the public literature; the Student Adapter does not, and it is
@@ -294,35 +295,34 @@ would make arm D unimplementable, and the failure mode is that it silently degen
 into arm A while still being labelled parameter sharing. `share_parameters` raises rather
 than skipping, for the same reason.
 
-### First numbers, and what they do not yet support
+### First numbers, now at three seeds
 
 `Software`, `k = 0`, 4 epochs with selection on `valid`, reported once on `eval`.
-**This is not a table anyone can draw a conclusion from**: seed 42 is complete, seed
-1337 stopped after arm D, and seed 7 never ran. Both seeds are shown rather than
-averaged, because averaging two runs would hide exactly the disagreement that matters.
+Seeds 42, 1337, and 7 are all complete; the table below is `analysis/transfer_table.py`'s
+output — mean, spread, and whether a gap against A clears the noise floor.
 
-Teacher alone on `eval`: **NE 0.5574, AUC 0.9260**.
+Teacher alone on `eval`: **NE 0.5574**.
 
-| arm | trainable dense | seed 42 | seed 1337 | same direction? |
-|---|---|---|---|---|
-| **A** no transfer | 91,333 | 0.5966 | 0.5438 | baseline |
-| **B** naive KD | 91,333 | 0.5690 ✓ | 0.5527 ✗ | **no** |
-| **C** KD + Student Adapter | 92,311 | **0.7767** | **0.7613** | yes, consistently worse |
-| **D** parameter sharing | 91,333 | 0.5551 ✓ | 0.4749 ✓ | yes, consistently better |
-| **E** representation transfer | 165,253 | 0.6194 | — | n=1 |
-| **E'** shuffled control | 165,253 | 0.5519 | — | n=1 |
+| arm | n | NE mean | spread | AUC | vs A | resolved? | trainable dense |
+|---|---|---|---|---|---|---|---|
+| **A** no transfer | 3 | 0.5883 | 0.0808 | 0.9172 | — | — | 91,333 |
+| **B** naive KD | 3 | 0.5658 | 0.0229 | 0.9270 | −3.83% | no | 91,333 |
+| **C** KD + Student Adapter | 3 | **0.7763** | 0.0296 | 0.9278 | **+31.95%** | **yes** | 92,311 |
+| **D** parameter sharing | 3 | 0.5277 | 0.0802 | 0.9338 | −10.31% | no | 91,333 |
+| **E** representation transfer | 3 | 0.6357 | 0.0844 | 0.9299 | +8.05% | no | 165,253 |
+| **E'** shuffled control | 3 | 0.5677 | 0.0253 | 0.9190 | −3.50% | no | 165,253 |
 
-Three readings, in descending order of how much weight they can carry.
+Three seeds changed the reading, not just the precision: **C's penalty is the only gap
+in this table that clears the noise floor.** The two-seed pass had looked like D and B
+also showed a consistent edge over A — at n=3 both collapse back inside the spread. The
+milestone's own point, made concrete: two runs agreeing is not evidence, it is a
+50/50 coin landing the same way twice.
 
-**1. C is much worse, consistently, and it is not a selection artefact.** +30% NE
-against A, where A's own spread across the two seeds is 0.053 and C sits 0.20 above
-it. The same ordering holds on `valid` (C 0.51–0.53 against A 0.476–0.477), so the
-epoch choice is not doing it.
-
-The hypothesis is that **the adapter turns distillation from a regulariser into an
-overfitting amplifier.** It fits ground truth on the student's own training window,
-and fits it better than the student does (`adapter_fit` 0.096 against `task` 0.15).
-The distillation target therefore becomes a high-fidelity copy of the training
+**1. C is 32% worse than no transfer, and this is the one resolved result in the
+table.** The hypothesis is that **the adapter turns distillation from a regulariser
+into an overfitting amplifier.** It fits ground truth on the student's own training
+window, and fits it better than the student does (`adapter_fit` 0.096 against `task`
+0.15). The distillation target therefore becomes a high-fidelity copy of the training
 labels, and the student is pushed to memorise that window harder than arm A ever is.
 At `k = 0` this is all cost: the teacher is not stale, so there is nothing for the
 adapter to correct, and it only relays the training labels a second time.
@@ -331,26 +331,24 @@ adapter to correct, and it only relays the training labels a second time.
 `k`*, so C being at its worst when the teacher is current is the baseline the sweep
 needs. What it does expose is a design question the GEM post leaves open: it says the
 adapter uses "the most recent ground-truth data", and if that is the student's own
-training window then this amplification is structural. Whether the adapter needs its
-own held-out slice is untested here.
+training window then this amplification is structural. **Whether the adapter needs its
+own held-out slice is the open blocker before M4** — untested here.
 
-**2. E loses to its own shuffled control** (0.6194 against 0.5519). The real teacher
-representation does worse than the same representation with the batch order permuted.
-At n=1 that resolves nothing, but there is **no evidence that E transfers anything
-useful**, and its extra 74k parameters are not earning their place. This is what the
-control was for: without it, 0.6194 reads as "E is slightly behind" rather than "E
-cannot beat its own noise".
+**2. E does not clearly beat its own shuffled control** (0.6357 against 0.5677, both
+inside noise). There is still no resolved evidence that E transfers anything useful,
+and its extra 74k parameters are not earning their place.
 
-**3. D is the only arm consistent in direction across both seeds**, and the cheapest
-— copy four quantile-bucket embedding tables and freeze them. That matches the reason
-those four vocabularies were the only ones shared: `price_bucket=7` means the same
-thing in every domain, and offset ids do not.
+**3. D and B's apparent edges over A did not survive a third seed.** Both looked like
+wins at n=2; at n=3 the gap sits inside A's own spread. Parameter sharing (D) is still
+the cheapest arm to run and the most principled — it copies the four quantile-bucket
+tables that are the only vocabularies actually shared across domains — but "cheapest
+and principled" is not the same claim as "measured to work", and right now only the
+first is true.
 
 Worth noting separately, because M4 is built on it: **NE and AUC disagree here.** C
-has a respectable AUC of 0.9276 and an NE of 0.7767; A has the worst AUC at 0.9127
-and a middling NE. C's *ranking* is intact and its *calibration* is what collapsed —
-the exact split claim B's premise depends on, showing up in real measurements rather
-than as an argument.
+has a respectable AUC of 0.9278 and an NE of 0.7763; the *ranking* is intact and the
+*calibration* is what collapsed — the exact split claim B's premise depends on, showing
+up in real measurements rather than as an argument.
 
 ```bash
 python -m data.transfer_data                       # reproduces the window table above
@@ -359,9 +357,10 @@ python -m analysis.transfer_table                  # mean, spread, and resolved?
 python train_transfer.py --all-domains --k 0 90 365 730 1095    # the M4 sweep
 ```
 
-Every gap above is inside or near the seed noise except C's, so `transfer_table`
-prints `resolved? no` for the rest by design. Reading a single run as a result is the
-one mistake this milestone is set up to prevent.
+Every gap above is inside the seed noise except C's, so `transfer_table` prints
+`resolved? no` for the rest by design. Reading a small number of runs as a result is
+the one mistake this milestone is set up to prevent — three seeds was still enough to
+overturn two of the four "yes" reads a two-seed pass gave.
 
 ---
 

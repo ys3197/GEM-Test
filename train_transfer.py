@@ -46,6 +46,13 @@ from train import normalized_entropy, roc_auc
 RUNS_DIR = ROOT / "runs" / "transfer"
 TEACHER_DIR = ROOT / "runs" / "teachers"
 
+# 样本构造方案的版本号，参与教师 checkpoint 的哈希。
+# 改过负采样方式之后忘了动它，于是一次运行加载了在**旧任务**上训练的教师，
+# 数字看起来完全正常。任何影响样本构造的改动都要 +1。
+#   v1  负样本从整个池化目录里均匀采（72-82% 落在用户根本不逛的域里）
+#   v2  负样本限制在用户自己的域内
+SAMPLE_SCHEME = "v2-domain-restricted-negatives"
+
 # 教师：基础模型。四个域合池，深而宽。
 TEACHER_CONFIG = MiniGEMConfig(variant="pooled", dim=32, n_layers=3,
                                n_queries=4, n_fmb=16, n_lcb=16, rank=8)
@@ -89,6 +96,7 @@ def teacher_tag(stale_days: int, args) -> str:
         "max_train": args.max_teacher,
         "domains": sorted(args.domains),
         "seed": args.seed,
+        "sample_scheme": SAMPLE_SCHEME,
     }, sort_keys=True)
     digest = hashlib.sha1(payload.encode()).hexdigest()[:8]
     return f"fm_k{stale_days}_{digest}"
@@ -153,7 +161,15 @@ def train_teacher(stale_days: int, args, device: str) -> tuple[MiniGEM, dict]:
 
 def train_student(arm: str, domain: str, teacher: MiniGEM | None,
                   splits: dict, args, device: str) -> dict:
-    """One arm, one domain. Returns its eval metrics and what it was built from."""
+    """
+    One arm, one domain.
+
+    The epoch is chosen on `valid` and the chosen epoch's weights are then scored
+    once on `eval`. Selecting and reporting on the same window would favour whichever
+    arm has the noisiest trajectory, since a noisier curve gets a luckier minimum —
+    and stability is one of the things distillation is supposed to change, so the
+    contamination would land directly on the comparison being made.
+    """
     torch.manual_seed(args.student_seed)   # 同一 k 下所有 arm 从同一初始化出发
 
     cfg = TransferConfig(arm=arm, alpha=args.alpha, temperature=args.temperature,
@@ -168,6 +184,9 @@ def train_student(arm: str, domain: str, teacher: MiniGEM | None,
     train_loader = make_loader(splits["pooled"], splits["student"], args.batch_size,
                                shuffle=True, n_negatives=args.negatives,
                                workers=args.workers)
+    valid_loader = make_loader(splits["pooled"], splits["valid"], args.batch_size,
+                               shuffle=False, n_negatives=args.negatives,
+                               limit=args.max_eval, workers=args.workers)
     eval_loader = make_loader(splits["pooled"], splits["eval"], args.batch_size,
                               shuffle=False, n_negatives=args.negatives,
                               limit=args.max_eval, workers=args.workers)
@@ -178,7 +197,7 @@ def train_student(arm: str, domain: str, teacher: MiniGEM | None,
     print(f"\n  {ARM_LABELS[arm]}   {model.n_trainable:,} trainable dense params"
           + (f"   shared: {', '.join(model.shared_fields)}" if model.shared_fields else ""))
 
-    history, best = [], {"ne": float("inf")}
+    history, best_valid, best_state = [], float("inf"), None
     for epoch in range(1, args.student_epochs + 1):
         model.train()
         t0, sums, seen = time.time(), {}, 0
@@ -198,20 +217,30 @@ def train_student(arm: str, domain: str, teacher: MiniGEM | None,
                 sums[k] = sums.get(k, 0.0) + v.item() * n
             seen += n
 
-        metrics = evaluate(model, eval_loader, device)
+        metrics = evaluate(model, valid_loader, device)
         metrics.update(epoch=epoch, seconds=round(time.time() - t0, 1),
                        **{f"loss_{k}": round(v / seen, 4) for k, v in sums.items()})
         history.append(metrics)
         losses = "  ".join(f"{k} {v / seen:.4f}" for k, v in sums.items() if k != "total")
-        print(f"    epoch {epoch}: NE {metrics['ne']:.4f}  AUC {metrics['auc']:.4f}  "
-              f"| {losses}  ({metrics['seconds']}s)")
+        print(f"    epoch {epoch}: valid NE {metrics['ne']:.4f}  "
+              f"AUC {metrics['auc']:.4f}  | {losses}  ({metrics['seconds']}s)")
 
-        if metrics["ne"] < best["ne"]:
-            best = dict(metrics)
+        if metrics["ne"] < best_valid:
+            best_valid, best_epoch = metrics["ne"], epoch
+            best_state = {k: v.detach().clone()
+                          for k, v in model.state_dict().items()
+                          if not k.startswith("teacher.")}
+
+    # 用 valid 选出的那一版权重，在 eval 上只跑一次
+    model.load_state_dict(best_state, strict=False)
+    test = evaluate(model, eval_loader, device)
+    print(f"    selected epoch {best_epoch} (valid NE {best_valid:.4f})  ->  "
+          f"eval NE {test['ne']:.4f}  AUC {test['auc']:.4f}")
 
     return {"arm": arm, "domain": domain, "config": asdict(cfg),
             "trainable": model.n_trainable, "shared_fields": model.shared_fields,
-            "best": best, "history": history}
+            "selected_epoch": best_epoch, "valid_ne": best_valid,
+            "best": test, "history": history}
 
 
 def run(args) -> dict:

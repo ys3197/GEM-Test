@@ -159,6 +159,7 @@ the interesting comparisons are *against nothing* and *against the naive version
 | **C** | + Student Adapter | a *corrected* output | the student's weights |
 | **D** | parameter sharing | the teacher's weights | shared tensors |
 | **E** | representation transfer | the teacher's features | an input at serving time |
+| **E'** | *control* — the same features, batch-shuffled | nothing | — |
 
 B and E differ more than they look. Distillation compresses the teacher into the
 student's parameters, so the student's capacity is the ceiling. Representation transfer
@@ -184,7 +185,7 @@ quantile buckets, where `price_bucket=7` means "expensive for its category" in e
 domain because the cuts were made on within-domain quantiles. Those four vocabularies
 are shared; store and category are offset like ids.
 
-### Two things that would have silently produced numbers
+### Four things that would have silently produced numbers
 
 **1. The teacher and the student have to live in the same id space.**
 
@@ -200,7 +201,29 @@ sees ids outside its own domain. The cost is an inflated student embedding table
 that are never indexed receive no gradient, and `n_dense_parameters` — what the arms are
 compared on — excludes embedding tables anyway.
 
-**2. `k` in days does not survive the move from Meta's data to Amazon's.**
+**2. Pooling made the task easier, not harder.**
+
+Negatives were being drawn uniformly from the whole pooled catalogue. But each user
+belongs to one domain, and the domains partition the catalogue:
+
+| domain | own items | share of catalogue | uniform negatives from a foreign domain |
+|---|---|---|---|
+| Software | 17,885 | 18.4% | **81.6%** |
+| Video_Games | 26,354 | 27.2% | **72.8%** |
+| Musical_Instruments | 25,528 | 26.3% | **73.7%** |
+| Industrial_and_Scientific | 27,229 | 28.1% | **71.9%** |
+
+So three quarters of the time the model only had to answer "is this item even in a
+category this user shops in" — which the category embedding answers immediately. It
+showed up as **AUC 0.988 pooled against 0.932 on the same solo data in M1**, with all
+five arms inside a 1.5% band because every one of them was pinned at the ceiling.
+Negatives are now drawn from the user's own domain, and AUC returns to 0.933.
+
+Worth naming the shape of this one: it is not a bug in the sampler, which did exactly
+what it was told. Pooling changed what "a random other item" means, and nothing in the
+code had a reason to notice.
+
+**3. `k` in days does not survive the move from Meta's data to Amazon's.**
 
 The original M4 plan was the teacher on `[.., T−k]` and the student on `[T−k, T]`, with
 `k ∈ {0, 3, 7, 14, 30}` days. Measuring it first:
@@ -218,13 +241,22 @@ teacher's training set, so the whole sweep would have returned five near-identic
 numbers — a false negative dressed as a result. Meta's week is enormous and its ad
 creatives turn over fast; here the catalogue barely moves.
 
+**4. Selecting the epoch and reporting the result on the same window.** This one was
+mine, not the data's. The first trainer picked the best epoch by NE on the eval window
+and then reported that same number — model selection on the test set. The bias is not
+constant across arms: a noisier trajectory gets a luckier minimum, so the contaminated
+metric rewards instability, which is one of the axes distillation is supposed to change.
+There is now a separate 90-day `valid` window for choosing the epoch, and `eval` is
+scored once with the chosen weights.
+
 The corrected design fixes the student's window and sweeps the teacher's cutoff over a
 range wide enough to matter:
 
 ```
- teacher  ├──── sliding 730d ────┤                          k = 0, 90, 365, 730, 1095
+ teacher  ├──── sliding 730d ────┤        k = 0, 90, 365, 730, 1095
  student                  ├──── 365d ────┤
- eval                                    ├── 180d ──┤
+ valid                                   ├─90d─┤          epoch selection
+ eval                                          ├──── 180d ────┤   reported once
                                          T
 ```
 

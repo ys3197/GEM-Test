@@ -79,5 +79,17 @@ TIME_GAP_BUCKETS_DAYS = [
 SPLIT_DATE = "2022-01-01"
 STUDENT_WINDOW_DAYS = 365     # 每域约 44k-56k 个位置
 TEACHER_WINDOW_DAYS = 730     # 滑动窗口：各 k 下 430k-524k，且越旧的窗口略多
-EVAL_WINDOW_DAYS = 180        # 每域约 19k-25k，教师和学生都没见过
+VALID_WINDOW_DAYS = 90        # 选 epoch 用，每域约 10k
+EVAL_WINDOW_DAYS = 180        # 只报告用，每域约 19k-25k
+
+# valid 和 eval 必须分开。早期版本在 eval 窗口上挑最好的 epoch，又把同一个数字
+# 报出来——那是在测试集上做模型选择，而且各 arm 的轨迹噪声不同，偏差大小也不同，
+# 恰好会污染 arm 之间的比较，也就是整个实验要测的东西。
 STALENESS_DAYS = [0, 90, 365, 730, 1095]
+
+# 种子噪声。同一 k、同一教师，只换学生的初始化种子：
+#   seed 42    A 0.2288   C 0.2356   (+2.99%)
+#   seed 1337  A 0.2357   C 0.2355   (-0.10%)
+# arm 之间的效应量是 1-3%，和噪声同量级，所以单次运行读不出任何结论。
+# 只把 CPU fp32 换成 GPU bf16 就足以让 A/C 的胜负翻转。
+SEEDS = [42, 1337, 7, 2024, 31337]

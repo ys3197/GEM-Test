@@ -1,5 +1,5 @@
 """
-The five ways a foundation model can hand knowledge to a vertical model.
+The ways a foundation model can hand knowledge to a vertical model, plus a control.
 
 GEM describes three post-training techniques — knowledge distillation with a
 Student Adapter, representation learning, and parameter sharing. Each transfers
@@ -12,6 +12,7 @@ something different, and the difference is *where the knowledge ends up*:
     C    + Student Adapter        a corrected output     the student's weights
     D    parameter sharing        the teacher's weights  shared tensors
     E    representation transfer  the teacher's features an input at serving time
+    E'   shuffled control         nothing (same shape)   —
 
 B and E differ more than they first appear. Distillation compresses the teacher
 into the student's parameters, so the student's capacity is the ceiling — a small
@@ -46,6 +47,13 @@ confident nonsense and no error. Every arm therefore builds both models against
 the pooled vocabularies, and the student simply never sees ids outside its own
 domain — see `data/transfer_data.py`.
 
+**Arm E needs a control, not a caveat.** Widening the student's head to accept the
+teacher's representation also gives it more capacity: 165k trainable dense parameters
+against 91k for the other arms. So `representation_shuffled` feeds the same teacher
+features with the batch order permuted — identical marginal distribution, identical
+parameter count, zero alignment to the sample. If E does not beat that control, its
+advantage was capacity and not transferred knowledge.
+
 **2. The adapter must be trained against ground truth alone.** If gradient from
 the student's distillation loss reaches it, it learns to make the teacher agree
 with the *student* rather than with reality — both sides nod at each other and the
@@ -63,7 +71,8 @@ import torch.nn.functional as F
 
 from models.gem import MiniGEM, PredictionHead
 
-ARMS = ["vm_only", "kd", "kd_adapter", "param_share", "representation"]
+ARMS = ["vm_only", "kd", "kd_adapter", "param_share", "representation",
+        "representation_shuffled"]
 
 ARM_LABELS = {
     "vm_only": "A  no transfer",
@@ -71,6 +80,7 @@ ARM_LABELS = {
     "kd_adapter": "C  KD + Student Adapter",
     "param_share": "D  parameter sharing",
     "representation": "E  representation transfer",
+    "representation_shuffled": "E' shuffled control",
 }
 
 # 只有分位数桶和时间桶在各域之间语义一致（"本品类里第 k 分位"），因此只有
@@ -97,6 +107,10 @@ class TransferConfig:
     @property
     def needs_teacher(self) -> bool:
         return self.arm != "vm_only"
+
+    @property
+    def uses_representation(self) -> bool:
+        return self.arm in ("representation", "representation_shuffled")
 
 
 def distillation_loss(
@@ -262,7 +276,7 @@ class TransferModel(nn.Module):
             self.adapter = StudentAdapter(n_popularity_buckets, n_price_buckets,
                                           config.adapter_hidden, config.adapter_context)
 
-        elif config.arm == "representation":
+        elif config.uses_representation:
             teacher_width = teacher.body.n_out * teacher.config.dim
             self.bridge = RepresentationBridge(teacher_width, config.representation_dim)
             # 学生的头要多吃一份输入，所以换掉——这是换接口，不是加宽
@@ -288,9 +302,14 @@ class TransferModel(nn.Module):
         """
         arm = self.config.arm
 
-        if arm == "representation":
+        if self.config.uses_representation:
             with torch.no_grad():
                 teacher_repr = self.teacher.embedding_output(batch)
+                if arm == "representation_shuffled":
+                    # 同样的边缘分布、同样的参数量，但和样本完全不对齐。
+                    # E 若只是靠更宽的头取胜，这一支会打成平手。
+                    teacher_repr = teacher_repr[torch.randperm(
+                        teacher_repr.size(0), device=teacher_repr.device)]
             student_repr = self.student.embedding_output(batch)
             fused = torch.cat([student_repr, self.bridge(teacher_repr)], dim=-1)
             return {"student": self.student.head(fused)}

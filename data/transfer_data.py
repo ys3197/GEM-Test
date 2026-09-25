@@ -4,15 +4,21 @@ Windows of time, for teacher and student.
 M3 and M4 need three slices of the calendar, not the two that `temporal_split`
 provides:
 
-    teacher  ├──── sliding 730d ────┤            k = 0, 90, 365, 730, 1095
+    teacher  ├──── sliding 730d ────┤        k = 0, 90, 365, 730, 1095
     student                  ├──── 365d ────┤
-    eval                                    ├── 180d ──┤
+    valid                                   ├─90d─┤
+    eval                                          ├──── 180d ────┤
                                             T
 
 The teacher is a foundation model: pooled across all four domains, trained on a
 fixed-width window ending `k` days before `T`. The student is a vertical model: one
-domain, always the same fresh window `[T-365, T]`. Both are scored on `[T, T+180]`,
-which neither has seen.
+domain, always the same fresh window `[T-365, T]`.
+
+**`valid` and `eval` are separate, and that is not decoration.** The first version
+picked the best epoch by NE on the eval window and then reported that same number —
+model selection on the test set. The bias it introduces is not constant across arms:
+a noisier trajectory gets a luckier minimum, so the contaminated metric rewards
+instability, which is one of the axes the arms actually differ on.
 
 `k` is the staleness dial. As it grows the teacher's knowledge ages while the
 student's data stays fixed, which is the regime GEM's Student Adapter exists for. If
@@ -59,6 +65,7 @@ from config import (  # noqa: E402
     STALENESS_DAYS,
     STUDENT_WINDOW_DAYS,
     TEACHER_WINDOW_DAYS,
+    VALID_WINDOW_DAYS,
 )
 from data.dataset import (  # noqa: E402
     DomainData,
@@ -127,6 +134,7 @@ def staleness_windows(
     stale_days: int,
     student_days: int = STUDENT_WINDOW_DAYS,
     teacher_days: int | None = TEACHER_WINDOW_DAYS,
+    valid_days: int = VALID_WINDOW_DAYS,
     eval_days: int = EVAL_WINDOW_DAYS,
 ) -> dict[str, tuple[pd.Timestamp | None, pd.Timestamp]]:
     """
@@ -159,10 +167,12 @@ def staleness_windows(
     teacher_end = t - pd.Timedelta(days=stale_days)
     teacher_start = (teacher_end - pd.Timedelta(days=teacher_days)
                      if teacher_days is not None else None)
+    valid_end = t + pd.Timedelta(days=valid_days)
     return {
         "teacher": (teacher_start, teacher_end),
         "student": (t - pd.Timedelta(days=student_days), t),
-        "eval": (t, t + pd.Timedelta(days=eval_days)),
+        "valid": (t, valid_end),
+        "eval": (valid_end, valid_end + pd.Timedelta(days=eval_days)),
     }
 
 
@@ -204,6 +214,7 @@ def transfer_splits(
     split_date: str | pd.Timestamp = SPLIT_DATE,
     teacher_days: int | None = TEACHER_WINDOW_DAYS,
     student_days: int = STUDENT_WINDOW_DAYS,
+    valid_days: int = VALID_WINDOW_DAYS,
     eval_days: int = EVAL_WINDOW_DAYS,
     domains: list[str] | None = None,
 ) -> dict:
@@ -219,7 +230,7 @@ def transfer_splits(
         raise ValueError(f"{domain!r} not in pooled data {pooled.domain_names}")
 
     windows = staleness_windows(pd.Timestamp(split_date), stale_days,
-                               student_days, teacher_days, eval_days)
+                               student_days, teacher_days, valid_days, eval_days)
     cut = {name: window_positions(pooled, *bounds) for name, bounds in windows.items()}
 
     def named(bounds) -> tuple[str | None, str]:
@@ -232,7 +243,8 @@ def transfer_splits(
         "windows": {k: named(v) for k, v in windows.items()},
         "teacher": cut["teacher"],                                    # 全部四个域
         "student": domain_positions(pooled, cut["student"], domain),   # 只此一域
-        "eval": domain_positions(pooled, cut["eval"], domain),
+        "valid": domain_positions(pooled, cut["valid"], domain),        # 选 epoch
+        "eval": domain_positions(pooled, cut["eval"], domain),          # 只报告
         "item_features": torch.from_numpy(pooled.item_features),
         "vocab_sizes": pooled.vocab_sizes,
     }
@@ -244,8 +256,9 @@ if __name__ == "__main__":
     pooled = pooled_cached()
     ref = len(window_positions(pooled, None, pd.Timestamp(SPLIT_DATE)))
 
-    print(f"split {SPLIT_DATE}   student window {STUDENT_WINDOW_DAYS}d   "
-          f"teacher window {TEACHER_WINDOW_DAYS}d (sliding)   eval {EVAL_WINDOW_DAYS}d\n")
+    print(f"split {SPLIT_DATE}   student {STUDENT_WINDOW_DAYS}d   "
+          f"teacher {TEACHER_WINDOW_DAYS}d sliding   "
+          f"valid {VALID_WINDOW_DAYS}d   eval {EVAL_WINDOW_DAYS}d\n")
 
     header = (f"{'k':>6}  {'teacher span':>23}  {'teacher n':>10}  "
               f"{'vs k=0':>7}  " + "  ".join(f"{d[:11]:>12}" for d in pooled.domain_names))
@@ -263,7 +276,8 @@ if __name__ == "__main__":
               + "  ".join(f"{m:>12,}" for m in per_domain))
 
     print(f"\nstudent window is fixed, so those four columns must not vary with k.")
-    print("eval positions (neither model sees these):")
+    print(f"{'':32}{'valid':>10}{'eval':>10}   (neither model sees either)")
     for d in pooled.domain_names:
-        print(f"  {d:30} {len(transfer_splits(d, 0)['eval']):>9,}")
+        s0 = transfer_splits(d, 0)
+        print(f"  {d:30}{len(s0['valid']):>10,}{len(s0['eval']):>10,}")
     print(f"\nreference: all positions before {SPLIT_DATE} = {ref:,}")

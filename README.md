@@ -20,15 +20,22 @@ So this repo tests the first kind and says so plainly. Negative results count.
 
 | | Claim | How it is tested | Status |
 |---|---|---|---|
-| **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | M2 — **at risk**, see below |
-| **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Deliberately train the teacher on data up to `T − k`, the student on `[T − k, T]`, sweep `k ∈ {0, 3, 7, 14, 30}` days | M4 |
+| **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | **deferred** — see M1 |
+| **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Age the teacher deliberately: it trains on a sliding 730-day window ending at `T − k`, the student always on `[T − 365, T]`, both scored on `[T, T + 180]`. Sweep `k ∈ {0, 90, 365, 730, 1095}` days | M4 |
 | **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 |
 
-**B is the centre of gravity.** A and C have close analogues in the public literature;
-the Student Adapter does not, and it is the only published mechanism that addresses
-teacher *staleness* rather than teacher *accuracy*. Its whole premise is falsifiable at
-small scale: if the gap between adapter and naive KD does not widen as the teacher ages,
-the mechanism does not do what it claims.
+**B is the centre of gravity**, and the reason claim A is deferred rather than next. A and
+C have close analogues in the public literature; the Student Adapter does not, and it is
+the only published mechanism that addresses teacher *staleness* rather than teacher
+*accuracy*. Its whole premise is falsifiable at small scale: if the gap between adapter
+and naive KD does not widen as the teacher ages, the mechanism does not do what it
+claims.
+
+M1 already measured why A is the weaker bet here — at a median of 7 events per user,
+"preserving the full sequence" has very little to preserve, so the honest outcome is most
+likely a null result about *this data* rather than about the structure. Effort went to
+M3/M4 instead. What A needs to become conclusive is written down in M1 below, so the gap
+is a stated choice rather than an omission.
 
 ---
 
@@ -140,6 +147,121 @@ python train.py --domain Software --variant interleaved --scale 0.5
 
 ---
 
+## M3 — five ways to hand knowledge from a foundation model to a vertical one
+
+GEM lists three post-training transfer techniques. Implemented as five arms, because
+the interesting comparisons are *against nothing* and *against the naive version*:
+
+| arm | technique | what crosses the gap | where it ends up |
+|---|---|---|---|
+| **A** | none | nothing | — |
+| **B** | knowledge distillation | the teacher's output | the student's weights |
+| **C** | + Student Adapter | a *corrected* output | the student's weights |
+| **D** | parameter sharing | the teacher's weights | shared tensors |
+| **E** | representation transfer | the teacher's features | an input at serving time |
+
+B and E differ more than they look. Distillation compresses the teacher into the
+student's parameters, so the student's capacity is the ceiling. Representation transfer
+hands the knowledge over as an *input*, so the student never has to memorise it — which
+is why GEM can claim it adds no inference overhead, since in production those features
+are precomputed and read from a table. This repo computes them live and tests the
+**quality** claim only. The latency claim is not reproduced and is not claimed.
+
+### The pooled foundation model, and why ids are offset
+
+Before building it, the obvious question got measured:
+
+```
+users appearing in 2+ domains    15,135 / 346,190  =  4.37%
+items appearing in 2+ domains    0                    (Amazon categories partition ASINs)
+```
+
+So cross-domain transfer cannot happen the obvious way — the same entity being seen in
+two places. Ids are therefore **offset per domain**: pooling gives the foundation model
+more data to fit its dense weights on, not a shared entity space it does not have. Two
+channels remain, and they are what the arms actually test — the dense weights, and the
+quantile buckets, where `price_bucket=7` means "expensive for its category" in every
+domain because the cuts were made on within-domain quantiles. Those four vocabularies
+are shared; store and category are offset like ids.
+
+### Two things that would have silently produced numbers
+
+**1. The teacher and the student have to live in the same id space.**
+
+```
+Video_Games item ids, loaded solo   :     3 .. 26,356
+Video_Games item ids, inside pooled : 17,888 .. 44,241
+```
+
+A teacher trained on pooled data, scoring a batch built from `load_domain`, looks up
+entirely unrelated products — confidently, and without raising anything. Every arm
+therefore builds both models against pooled vocabularies, and the student simply never
+sees ids outside its own domain. The cost is an inflated student embedding table; rows
+that are never indexed receive no gradient, and `n_dense_parameters` — what the arms are
+compared on — excludes embedding tables anyway.
+
+**2. `k` in days does not survive the move from Meta's data to Amazon's.**
+
+The original M4 plan was the teacher on `[.., T−k]` and the student on `[T−k, T]`, with
+`k ∈ {0, 3, 7, 14, 30}` days. Measuring it first:
+
+| | |
+|---|---|
+| student positions at `k = 0` | **0** — `[T, T]` is a zero-width window |
+| student positions at `k = 3` | **355** |
+| teacher data removed at `k = 7` | **0.14%** |
+| teacher data removed at `k = 30` | **0.54%** |
+
+Two independent failures. The design tied the student's *data volume* to the teacher's
+*lag*, which are independent in production; and a week of Amazon reviews is 0.14% of the
+teacher's training set, so the whole sweep would have returned five near-identical
+numbers — a false negative dressed as a result. Meta's week is enormous and its ad
+creatives turn over fast; here the catalogue barely moves.
+
+The corrected design fixes the student's window and sweeps the teacher's cutoff over a
+range wide enough to matter:
+
+```
+ teacher  ├──── sliding 730d ────┤                          k = 0, 90, 365, 730, 1095
+ student                  ├──── 365d ────┤
+ eval                                    ├── 180d ──┤
+                                         T
+```
+
+| `k` | teacher window | teacher positions | vs `k=0` | student positions/domain |
+|---|---|---|---|---|
+| 0 | 2020-01-02 .. 2022-01-01 | 429,890 | — | 44k – 56k |
+| 90 | 2019-10-04 .. 2021-10-03 | 460,611 | +7.1% | 44k – 56k |
+| 365 | 2019-01-02 .. 2021-01-01 | 499,802 | +16.3% | 44k – 56k |
+| 730 | 2018-01-02 .. 2020-01-02 | 523,716 | +21.8% | 44k – 56k |
+| 1095 | 2017-01-02 .. 2019-01-02 | 522,439 | +21.5% | 44k – 56k |
+
+The teacher window **slides** rather than expanding, which costs some realism and buys
+the experiment's validity. An expanding teacher (everything up to `T−k`, what a
+production FM actually trains on) loses 28% of its data at `k = 1095`, so staleness and
+volume move together and a degradation cannot be attributed to either. With a sliding
+window the volume is flat — and slightly *higher* for older windows, because these
+categories were marginally busier in 2018 than 2021. So the confound runs **against** the
+hypothesis: an older teacher gets more data, and if it still does worse, staleness is
+what is left. Both modes are implemented; `teacher_days=None` selects expanding.
+
+### Constraint inherited from arm D
+
+Arm D copies embedding tables, which requires matching shapes, so **the student has the
+teacher's `dim` and is made smaller along depth and inner widths** (`n_layers` 3→1,
+`n_fmb`/`n_lcb` 16→8, `n_queries` 4→2). This is not a free choice: a `dim`-scaled student
+would make arm D unimplementable, and the failure mode is that it silently degenerates
+into arm A while still being labelled parameter sharing. `share_parameters` raises rather
+than skipping, for the same reason.
+
+```bash
+python -m data.transfer_data                       # reproduces the window table above
+python train_transfer.py --domain Software --k 0
+python train_transfer.py --all-domains --k 0 90 365 730 1095    # the M4 sweep
+```
+
+---
+
 ## Setup
 
 ```bash
@@ -151,9 +273,10 @@ python -m data.download           # ~7.9 GB across four domains
 python -m data.probe              # density check — run this before trusting a domain
 python -m data.prepare            # k-core, temporal ordering, parquet
 python -m data.features           # vocabularies and quantile buckets
-python -m analysis.padding_waste  # reproduces the figure above
+python -m analysis.padding_waste  # reproduces the M0 figure
+python -m data.transfer_data      # reproduces the M3 window table
 
-pytest tests/ -q                  # 17 guardrails; skips cleanly without data
+pytest tests/ -q                  # 41 guardrails; skips cleanly without data
 ```
 
 Models (M1 onward) additionally need a CUDA build of PyTorch:
@@ -177,13 +300,17 @@ data/
   prepare.py                k-core filter, temporal sort, parquet output
   features.py               categorical encoding: vocabularies and quantile buckets
   dataset.py                causal sample construction, jagged batching
+  pooled.py                 four domains in one id space, for the foundation model
+  transfer_data.py          teacher / student / eval windows; the staleness dial
 models/
   embeddings.py             shared-width field tables, sequence masking
   wukong.py                 stacked factorization machines (non-sequence tower)
   sequence.py               event model + candidate-keyed attention pooling, O(M*N)
   interformer.py            the two structures claim A compares
   gem.py                    assembly; one config drives every width
+  transfer.py               the five FM-to-VM transfer arms
 train.py                    training loop, normalized entropy, AUC
+train_transfer.py           trains the pooled FM once, then five students from it
 analysis/
   padding_waste.py          M0 result
 tests/                      causality and architecture guardrails — no GPU needed

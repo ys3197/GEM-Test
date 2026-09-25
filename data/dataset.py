@@ -189,6 +189,12 @@ class InteractionDataset(Dataset):
     Uniform negative sampling is the conventional baseline. Popularity-weighted
     sampling is closer to what an ads system actually serves, and is available
     behind a flag so the choice stays visible rather than baked in.
+
+    `negative_ranges` restricts each user's negatives to an id range, and on pooled
+    data it is not optional. Sampling over the whole pooled catalogue draws 72-82%
+    of negatives from domains the user never shops in, which reduces the task to
+    "is this even my category" — AUC 0.932 solo, 0.988 pooled, and every model at
+    the ceiling. See `data.pooled.user_negative_ranges`.
     """
 
     def __init__(
@@ -198,20 +204,28 @@ class InteractionDataset(Dataset):
         n_negatives: int = 4,
         max_seq_len: int = MAX_SEQ_LEN,
         popularity_negatives: bool = False,
+        negative_ranges: np.ndarray | None = None,
         seed: int = RANDOM_SEED,
     ) -> None:
         self.data = data
         self.positions = positions
         self.n_negatives = n_negatives
         self.max_seq_len = max_seq_len
+        self.negative_ranges = negative_ranges
         self.rng = np.random.default_rng(seed)
 
+        self.neg_p = None
+        self._range_p: dict[tuple[int, int], np.ndarray] = {}
         if popularity_negatives:
             counts = np.bincount(data.user_items, minlength=data.n_items).astype("float64")
-            counts[:3] = 0.0                      # 保留位不参与采样
+            counts[:N_RESERVED] = 0.0             # 保留位不参与采样
             self.neg_p = counts / counts.sum()
-        else:
-            self.neg_p = None
+            # 每个域只有一个区间，所以按区间预先归一化，而不是每次采样时切片
+            if negative_ranges is not None:
+                for lo, hi in np.unique(negative_ranges, axis=0):
+                    if hi > lo:
+                        seg = counts[lo:hi]
+                        self._range_p[(int(lo), int(hi))] = seg / seg.sum()
 
     def __len__(self) -> int:
         return len(self.positions) * (1 + self.n_negatives)
@@ -226,7 +240,7 @@ class InteractionDataset(Dataset):
         if slot == 0:
             item, label = true_item, 1.0
         else:
-            item, label = self._sample_negative(hist, true_item), 0.0
+            item, label = self._sample_negative(user_idx, hist, true_item), 0.0
 
         return {
             "user": int(user_idx) + 3,          # 对齐词表里的保留位偏移
@@ -236,14 +250,19 @@ class InteractionDataset(Dataset):
             "label": label,
         }
 
-    def _sample_negative(self, hist: np.ndarray, true_item: int) -> int:
+    def _sample_negative(self, user_idx: int, hist: np.ndarray, true_item: int) -> int:
         """Reject items the user already interacted with, but bound the retries."""
         seen = set(hist.tolist()) | {true_item}
+        lo, hi = (self.negative_ranges[user_idx] if self.negative_ranges is not None
+                  else (N_RESERVED, self.data.n_items))
+
         for _ in range(10):
-            if self.neg_p is not None:
-                cand = int(self.rng.choice(self.data.n_items, p=self.neg_p))
+            if self.neg_p is None:
+                cand = int(self.rng.integers(lo, hi))
+            elif self.negative_ranges is not None:
+                cand = lo + int(self.rng.choice(hi - lo, p=self._range_p[(lo, hi)]))
             else:
-                cand = int(self.rng.integers(3, self.data.n_items))
+                cand = int(self.rng.choice(self.data.n_items, p=self.neg_p))
             if cand not in seen:
                 return cand
         return cand      # 罕见：连续碰撞，接受一个假阴性而不是无限重试

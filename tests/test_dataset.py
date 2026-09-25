@@ -178,6 +178,50 @@ def test_pooling_preserves_each_domains_sample_count(pooled):
                len(solo["train"])
 
 
+def test_pooled_negatives_stay_inside_the_users_own_domain(pooled):
+    """
+    Pooling without this restriction makes the task *easier*, not harder.
+
+    Uniform negatives over the pooled catalogue land outside the user's domain
+    72-82% of the time, reducing the problem to "is this item even in a category
+    this user shops in" — which the category embedding answers immediately. It
+    showed up as AUC 0.932 solo against 0.988 pooled, with every transfer arm
+    pinned at the ceiling.
+    """
+    from data.pooled import user_negative_ranges
+
+    ranges = user_negative_ranges(pooled)
+    splits = temporal_split(pooled, pd.Timestamp("2021-01-01"))
+    ds = InteractionDataset(pooled, splits["train"][:2000], n_negatives=4,
+                            negative_ranges=ranges, seed=11)
+
+    for i in range(0, 10_000, 5):
+        user_idx = ds.positions[i // 5][0]
+        lo, hi = ranges[user_idx]
+        for slot in range(1, 5):
+            item = ds[i + slot]["item"]
+            assert lo <= item < hi, (
+                f"negative {item} for user {user_idx} came from outside "
+                f"[{lo}, {hi}) — a different domain entirely"
+            )
+
+
+def test_unrestricted_pooled_negatives_really_do_leak_across_domains(pooled):
+    """The control for the test above: without ranges, most negatives are foreign."""
+    from data.pooled import user_negative_ranges
+
+    ranges = user_negative_ranges(pooled)
+    splits = temporal_split(pooled, pd.Timestamp("2021-01-01"))
+    ds = InteractionDataset(pooled, splits["train"][:2000], n_negatives=4, seed=11)
+
+    foreign = 0
+    for i in range(0, 10_000, 5):
+        lo, hi = ranges[ds.positions[i // 5][0]]
+        foreign += sum(not (lo <= ds[i + slot]["item"] < hi) for slot in range(1, 5))
+
+    assert foreign / 8000 > 0.5, "expected most unrestricted negatives to be foreign"
+
+
 def test_causality_survives_pooling(pooled):
     splits = temporal_split(pooled, pd.Timestamp("2021-01-01"))
     rng = np.random.default_rng(3)

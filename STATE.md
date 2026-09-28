@@ -346,8 +346,8 @@ raw NE mean/spread columns are kept for description, not for the verdict.
    with `k`*, so C at its worst when the teacher is current is the baseline the sweep
    needs. What it does expose is a question the GEM post leaves open — it says the
    adapter uses "the most recent ground-truth data", and if that is the student's own
-   training window the amplification is structural. **Untested — this is now the
-   single open blocker before M4.** See §6.
+   training window the amplification could be structural. **Tested directly in §4.2b,
+   below — the self-fit explanation did not hold up.**
 
 2. **D (parameter sharing) is resolved as better than no transfer, by ~6% NE, in all
    three individual seeds** — this only became visible under the paired comparison; the
@@ -366,6 +366,61 @@ raw NE mean/spread columns are kept for description, not for the verdict.
 AUC (0.9278) while its NE collapses (0.7763); the *ranking* stays intact and the
 *calibration* is what broke — the calibration-before-ranking split claim B's premise
 depends on, appearing as a measurement rather than an argument.
+
+### 4.2b Adapter-holdout ablation — the self-fit hypothesis did not hold up
+
+§4.2 reading 1 proposed a specific mechanism for C's damage: the adapter fits ground
+truth on the exact window it also hands distillation targets from, so the target
+becomes a high-fidelity copy of the training labels. `kd_adapter_holdout` tests this
+directly (`models/transfer.py`, `train_transfer.pretrain_adapter`): the adapter is
+pretrained to convergence on the earlier 75% of the student's window and then frozen,
+so every target it produces for the student comes from data it never saw. 3 seeds
+(42, 1337, 7), `Software`, `k = 0`.
+
+The naive comparison — held-out C's penalty against the *original* full-window C's
+32% — would be confounded, because the held-out student also trains on far less data
+(the later 25% only, ~8,374 positions against ~49,807). So the real test reruns the
+**original, joint-fit** `kd_adapter` on that same smaller window, giving three arms on
+an identical ~8,374-position training set:
+
+```
+same distill window (~8,374 positions), paired by seed:
+  arm                          seed42   seed1337  seed7    paired mean   pct vs A   resolved?
+  A  no transfer               0.6083   0.5829    0.5855   —             —          —
+  C  joint-fit adapter         0.6522   0.6892    0.7000   +0.0882       +14.90%    yes
+  C* held-out adapter          0.7054   0.6955    0.7416   +0.1219       +20.59%    yes
+
+  joint vs held-out (same window): per-seed [-0.053, -0.006, -0.042]   mean -0.034   spread 0.047   not resolved
+```
+
+Both C and C* are resolved as worse than A on this window — replicating §4.2's
+direction at a different, smaller scale. But **the difference between them is not
+resolved**, and what signal there is points the wrong way: the held-out adapter is
+numerically *worse*, not better, than the one that fit the exact labels it distills
+from. If self-fit leakage were the dominant mechanism, held-out should have clearly
+closed some of the gap to A; instead it did not move, or moved slightly against the
+hypothesis.
+
+**Reading:** the specific "adapter memorises its own fitting window" story is not
+supported — removing that leakage entirely left the arm just as damaged. The more
+consistent explanation across all the data collected so far: arm B (naive KD, no
+adapter) is *not* resolved as harmful at `k = 0` (§4.2, −3.83%, inside noise) — only
+the **adapter-processed** signal hurts, whether or not its fit data overlaps the
+distillation data. That points at the adapter's learned correction itself being a
+worse distillation target than the raw teacher logit when the teacher is not stale —
+not because it copied labels, but because at `k = 0` there is nothing legitimate to
+correct, and a small, freshly-fit residual (32 hidden units, 8-dim context, on 8k–50k
+domain-only positions) plausibly adds variance rather than signal. This is exactly the
+condition the M4 sweep is built to distinguish from: if this is right, C's penalty
+should *shrink* as `k` grows and the teacher actually goes stale, because then the
+adapter has something real to fix. If C stays damaged at every `k`, the mechanism does
+not hold at this scale, full stop — see the falsification criterion in §6.
+
+`runs/transfer/m3_holdout_seed*.json` and `m3_adapter_samewindow_seed*.json` hold the
+raw results; this ablation was not run through `analysis/transfer_table.py` because
+that tool groups by `(k, domain, arm)` without regard to training-window size, and
+would silently average these smaller-window runs together with the original
+full-window ones under the same `vm_only`/`kd_adapter` keys.
 
 ### 4.3 M1 smoke test (claim A, for reference)
 
@@ -399,14 +454,15 @@ runs/transfer/m3_seed7.json
 
 ## 6. Open questions and next steps
 
-**Untested hypothesis worth resolving before M4 — does the adapter need held-out
-data?** §4.2 reading 1 says C's damage comes from the adapter fitting the student's own
-training window. The test is cheap: split the student's 365-day window, fit the adapter
-on one part and train the student on the other, and see whether C's 30% penalty at
-`k = 0` shrinks. If it does, the adapter needs its own slice and M4 should use that
-version — otherwise M4 measures a self-inflicted wound at every `k`, which would mask
-the staleness effect it is looking for. **This is the single highest-value next
-experiment**, because it decides whether M4's C arm is even implemented correctly.
+**Resolved — the adapter does not need held-out data, or at least that is not what is
+hurting it at `k = 0`.** See §4.2b: a held-out adapter (pretrained on data disjoint from
+what it distills from) is statistically indistinguishable from the original joint-fit
+adapter, and if anything numerically worse. M4 does **not** need a holdout variant of
+arm C — the original `kd_adapter` is implemented correctly, and its `k = 0` damage has
+a different cause than the one first suspected. The live hypothesis now is that the
+adapter's learned correction is simply a worse distillation target than the raw
+teacher when there is nothing stale to correct, which is exactly what the `k` sweep
+below is positioned to test.
 
 **D (parameter sharing) is now a resolved baseline, not a speculative one** — §4.2 was
 re-read with a paired-by-seed comparison (same seed drives every arm's student init

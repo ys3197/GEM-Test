@@ -321,21 +321,26 @@ But paired by seed, D beats A in **all three seeds individually** (−0.042, −
 real, resolved effect that comparing raw ranges was hiding. C's penalty is resolved
 either way (paired mean +0.188, spread 0.051) — it was never a borderline case.
 
-**1. C is 32% worse than no transfer — resolved, and by a wide margin.** The hypothesis
-is that **the adapter turns distillation from a regulariser into an overfitting
-amplifier.** It fits ground truth on the student's own training window, and fits it
-better than the student does (`adapter_fit` 0.096 against `task` 0.15). The
-distillation target therefore becomes a high-fidelity copy of the training labels, and
-the student is pushed to memorise that window harder than arm A ever is. At `k = 0`
-this is all cost: the teacher is not stale, so there is nothing for the adapter to
-correct, and it only relays the training labels a second time.
+**1. C is 32% worse than no transfer — resolved, and by a wide margin.** The first
+hypothesis was that **the adapter turns distillation from a regulariser into an
+overfitting amplifier**: it fits ground truth on the student's own training window, and
+fits it better than the student does (`adapter_fit` 0.096 against `task` 0.15), so the
+distillation target becomes a high-fidelity copy of the training labels.
 
-**This is not evidence against claim B.** The claim is that C's advantage *widens with
-`k`*, so C being at its worst when the teacher is current is the baseline the sweep
-needs. What it does expose is a design question the GEM post leaves open: it says the
-adapter uses "the most recent ground-truth data", and if that is the student's own
-training window then this amplification is structural. **Whether the adapter needs its
-own held-out slice is the open blocker before M4** — untested here.
+**That specific hypothesis was tested directly and did not hold up.** A
+`kd_adapter_holdout` arm pretrains the adapter on an earlier, disjoint 75% slice of the
+student's window and freezes it, so its distillation targets never touch data it was
+fit on. On a matched training window (~8,374 positions), both the original joint-fit
+adapter and the held-out one are resolved as worse than no-transfer (+14.9% and +20.6%
+respectively) — and the gap *between* them is not resolved, with what signal exists
+running the wrong way (held-out is numerically worse, not better). Removing the
+self-fit leakage entirely did not fix arm C. Since naive KD without an adapter (arm B)
+is *not* resolved as harmful at `k = 0`, the more consistent reading is that the
+adapter's learned correction is itself a worse distillation target than the raw teacher
+when the teacher isn't stale — not because it copied labels, but because there is
+nothing legitimate for it to fix yet. **This is exactly the condition M4's `k` sweep
+exists to test**: if right, C's penalty should shrink as the teacher actually goes
+stale; if it doesn't, the mechanism fails at this scale regardless of `k`.
 
 **2. D (parameter sharing) is resolved as a real win, once compared correctly.** Copying
 four quantile-bucket embedding tables and freezing them beats no-transfer by ~6% NE, in

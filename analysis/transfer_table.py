@@ -41,7 +41,7 @@ from pathlib import Path
 import numpy as np
 
 from config import ROOT
-from models.transfer import ARM_LABELS, ARMS
+from models.transfer import ALL_ARMS, ARM_LABELS
 
 RUNS_DIR = ROOT / "runs" / "transfer"
 
@@ -73,7 +73,7 @@ def summarise(rows: list[dict]) -> None:
         return
 
     for k, domain in sorted({(k, d) for k, d, _ in grouped}):
-        teacher = np.mean([r["teacher_ne"] for a in ARMS
+        teacher = np.mean([r["teacher_ne"] for a in ALL_ARMS
                            for r in grouped.get((k, domain, a), [])])
         print(f"\n{domain}   k={k}d   teacher alone: NE {teacher:.4f}")
 
@@ -85,7 +85,7 @@ def summarise(rows: list[dict]) -> None:
         base = grouped.get((k, domain, "vm_only"), [])
         base_ne_by_seed = {r["seed"]: r["ne"] for r in base}
 
-        for arm in ARMS:
+        for arm in ALL_ARMS:
             runs = grouped.get((k, domain, arm), [])
             if not runs:
                 continue

@@ -87,6 +87,13 @@ EVAL_WINDOW_DAYS = 180        # 只报告用，每域约 19k-25k
 # 恰好会污染 arm 之间的比较，也就是整个实验要测的东西。
 STALENESS_DAYS = [0, 90, 365, 730, 1095]
 
+# arm C（KD + Student Adapter）在 k=0 时比不做迁移还差 32%（resolved）。怀疑：adapter
+# 在学生自己的训练窗口上拟合真实标签，比学生自己拟合得还好，蒸馏目标变成了训练标签的
+# 高保真复制。检验方法：把学生窗口切开，前 75%（约 274 天）只用来 fit adapter，
+# 后 25%（约 91 天，量级对齐 VALID_WINDOW_DAYS）用来训练学生——adapter 给出的蒸馏目标
+# 全部来自它没见过的数据。见 data/transfer_data.py 的 adapter_holdout_frac。
+ADAPTER_HOLDOUT_FRAC = 0.75
+
 # 种子噪声。同一 k、同一教师，只换学生的初始化种子：
 #   seed 42    A 0.2288   C 0.2356   (+2.99%)
 #   seed 1337  A 0.2357   C 0.2355   (-0.10%)

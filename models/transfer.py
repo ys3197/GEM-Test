@@ -59,6 +59,18 @@ the student's distillation loss reaches it, it learns to make the teacher agree
 with the *student* rather than with reality — both sides nod at each other and the
 distillation signal collapses toward zero. Nothing errors out. The separation is
 enforced in `TransferModel.loss` and pinned by a test.
+
+**`kd_adapter_holdout` is an ablation of C, not a sixth technique.** At `k = 0`,
+arm C is 32% worse than no transfer (resolved, not noise) — the hypothesis is that
+the adapter fits ground truth on the exact window the student also trains on, and
+fits it better than the student does, so the "correction" it hands the student is a
+high-fidelity copy of the training labels rather than a real signal. This arm tests
+that: the adapter is pretrained to convergence on an earlier slice of the student's
+window (`train_transfer.py`'s `pretrain_adapter`) and then frozen, so every
+distillation target it produces for the student comes from data it was never fit
+on. It is kept out of `ARMS` — and out of `--arms`'s default — because it needs
+`adapter_holdout_frac` set on the splits (`data/transfer_data.py`) to mean anything;
+selecting it without that is a configuration error, not a variant, so it raises.
 """
 
 from __future__ import annotations
@@ -74,6 +86,11 @@ from models.gem import MiniGEM, PredictionHead
 ARMS = ["vm_only", "kd", "kd_adapter", "param_share", "representation",
         "representation_shuffled"]
 
+# 消融实验专用：不在默认的六臂里，因为它需要 splits 里有 adapter_holdout_frac
+# 切出来的 adapter_fit/distill，否则选它就是配置错误，应该报错而不是安静退化。
+ABLATION_ARMS = ["kd_adapter_holdout"]
+ALL_ARMS = ARMS + ABLATION_ARMS
+
 ARM_LABELS = {
     "vm_only": "A  no transfer",
     "kd": "B  naive KD",
@@ -81,6 +98,7 @@ ARM_LABELS = {
     "param_share": "D  parameter sharing",
     "representation": "E  representation transfer",
     "representation_shuffled": "E' shuffled control",
+    "kd_adapter_holdout": "C* KD + Adapter (held-out fit)",
 }
 
 # 只有分位数桶和时间桶在各域之间语义一致（"本品类里第 k 分位"），因此只有
@@ -99,8 +117,8 @@ class TransferConfig:
     freeze_shared: bool = True   # 参数共享时冻结借来的张量
 
     def __post_init__(self) -> None:
-        if self.arm not in ARMS:
-            raise ValueError(f"unknown arm {self.arm!r}; choose from {ARMS}")
+        if self.arm not in ALL_ARMS:
+            raise ValueError(f"unknown arm {self.arm!r}; choose from {ALL_ARMS}")
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"alpha must be in [0, 1], got {self.alpha}")
 
@@ -272,7 +290,7 @@ class TransferModel(nn.Module):
         self.adapter = None
         self.bridge = None
 
-        if config.arm == "kd_adapter":
+        if config.arm in ("kd_adapter", "kd_adapter_holdout"):
             self.adapter = StudentAdapter(n_popularity_buckets, n_price_buckets,
                                           config.adapter_hidden, config.adapter_context)
 
@@ -316,7 +334,7 @@ class TransferModel(nn.Module):
 
         out = {"student": self.student(batch)}
 
-        if arm in ("kd", "kd_adapter"):
+        if arm in ("kd", "kd_adapter", "kd_adapter_holdout"):
             with torch.no_grad():
                 out["teacher"] = self.teacher(batch)
 
@@ -352,6 +370,14 @@ class TransferModel(nn.Module):
             parts["total"] = (cfg.alpha * task
                               + (1 - cfg.alpha) * parts["kd"]
                               + parts["adapter_fit"])
+
+        elif cfg.arm == "kd_adapter_holdout":
+            # adapter 已经在 adapter_fit 切片上单独训练并冻结（见
+            # train_transfer.pretrain_adapter），这里不再有 adapter_fit 项——
+            # 它的权重不该继续被更新，蒸馏目标完全来自它没见过的数据。
+            parts["kd"] = distillation_loss(out["student"], out["adapter"].detach(),
+                                            cfg.temperature)
+            parts["total"] = cfg.alpha * task + (1 - cfg.alpha) * parts["kd"]
 
         else:
             parts["total"] = task

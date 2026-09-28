@@ -35,12 +35,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from config import DOMAINS, RANDOM_SEED, ROOT, SPLIT_DATE, STALENESS_DAYS
+from config import ADAPTER_HOLDOUT_FRAC, DOMAINS, RANDOM_SEED, ROOT, SPLIT_DATE, STALENESS_DAYS
 from data.transfer_data import make_loader, transfer_splits
 from models.gem import MiniGEM, MiniGEMConfig
-from models.transfer import ARM_LABELS, ARMS, TransferConfig, TransferModel
+from models.transfer import ALL_ARMS, ARM_LABELS, ARMS, TransferConfig, TransferModel
 from train import normalized_entropy, roc_auc
 
 RUNS_DIR = ROOT / "runs" / "transfer"
@@ -159,6 +160,51 @@ def train_teacher(stale_days: int, args, device: str) -> tuple[MiniGEM, dict]:
     return model, meta
 
 
+def pretrain_adapter(model: TransferModel, splits: dict, args, device: str) -> None:
+    """
+    Fit the Student Adapter to convergence on `adapter_fit`, then freeze it.
+
+    This is what makes `kd_adapter_holdout` different from `kd_adapter`: the
+    adapter here never sees the labels it will later be asked to produce
+    distillation targets for. It is trained standalone against the teacher's
+    (frozen) output plus item context — exactly the inputs it uses in
+    `TransferModel.forward` — so switching it into the main loop afterwards
+    changes nothing about its interface, only that its weights stop moving.
+    """
+    loader = make_loader(splits["pooled"], splits["adapter_fit"], args.batch_size,
+                         shuffle=True, n_negatives=args.negatives,
+                         workers=args.workers)
+    opt = torch.optim.AdamW(model.adapter.parameters(), lr=args.student_lr,
+                            weight_decay=args.wd)
+
+    model.adapter.train()
+    print(f"    adapter pretrain: {len(splits['adapter_fit']):,} positions "
+          f"(held out from the student's {len(splits['student']):,})")
+    for epoch in range(1, args.adapter_epochs + 1):
+        t0, running, seen = time.time(), 0.0, 0
+        for batch in loader:
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            with torch.no_grad():
+                teacher_out = model.teacher(batch)
+                feats = model.teacher.item_features(batch["item"])
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device == "cuda"):
+                adapter_out = model.adapter(teacher_out, feats["popularity_bucket"],
+                                            feats["price_bucket"], batch["hist_len"])
+                loss = F.binary_cross_entropy_with_logits(adapter_out.float(),
+                                                          batch["label"])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            n = len(batch["label"])
+            running += loss.item() * n
+            seen += n
+        print(f"      adapter epoch {epoch}: loss {running / seen:.4f}  "
+              f"({time.time() - t0:.0f}s)")
+
+    model.adapter.requires_grad_(False)
+    model.adapter.eval()
+
+
 def train_student(arm: str, domain: str, teacher: MiniGEM | None,
                   splits: dict, args, device: str) -> dict:
     """
@@ -181,7 +227,24 @@ def train_student(arm: str, domain: str, teacher: MiniGEM | None,
                           n_popularity_buckets=vocab["popularity_bucket"],
                           n_price_buckets=vocab["price_bucket"]).to(device)
 
-    train_loader = make_loader(splits["pooled"], splits["student"], args.batch_size,
+    if arm == "kd_adapter_holdout":
+        if "adapter_fit" not in splits:
+            raise ValueError(
+                "arm 'kd_adapter_holdout' needs splits built with "
+                "adapter_holdout_frac set (see data/transfer_data.transfer_splits); "
+                "without it there is nothing to hold the adapter's fit out from, "
+                "and running it anyway would silently repeat the exact bug this "
+                "arm exists to test.")
+        pretrain_adapter(model, splits, args, device)
+        train_positions = splits["distill"]
+    elif args.train_window == "distill":
+        if "distill" not in splits:
+            raise ValueError("--train-window distill needs --adapter-holdout-frac set")
+        train_positions = splits["distill"]
+    else:
+        train_positions = splits["student"]
+
+    train_loader = make_loader(splits["pooled"], train_positions, args.batch_size,
                                shuffle=True, n_negatives=args.negatives,
                                workers=args.workers)
     valid_loader = make_loader(splits["pooled"], splits["valid"], args.batch_size,
@@ -194,8 +257,11 @@ def train_student(arm: str, domain: str, teacher: MiniGEM | None,
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=args.student_lr, weight_decay=args.wd)
 
+    window_note = (f"   training on {len(train_positions):,} positions"
+                  if len(train_positions) != len(splits["student"]) else "")
     print(f"\n  {ARM_LABELS[arm]}   {model.n_trainable:,} trainable dense params"
-          + (f"   shared: {', '.join(model.shared_fields)}" if model.shared_fields else ""))
+          + (f"   shared: {', '.join(model.shared_fields)}" if model.shared_fields else "")
+          + window_note)
 
     history, best_valid, best_state = [], float("inf"), None
     for epoch in range(1, args.student_epochs + 1):
@@ -240,6 +306,7 @@ def train_student(arm: str, domain: str, teacher: MiniGEM | None,
     return {"arm": arm, "domain": domain, "config": asdict(cfg),
             "trainable": model.n_trainable, "shared_fields": model.shared_fields,
             "selected_epoch": best_epoch, "valid_ne": best_valid,
+            "n_train_positions": len(train_positions),
             "best": test, "history": history}
 
 
@@ -253,7 +320,8 @@ def run(args) -> dict:
 
         for domain in args.run_domains:
             splits = transfer_splits(domain, stale_days, split_date=args.split_date,
-                                     domains=args.domains)
+                                     domains=args.domains,
+                                     adapter_holdout_frac=args.adapter_holdout_frac)
             ref = evaluate(teacher, make_loader(splits["pooled"], splits["eval"],
                                                 args.batch_size, shuffle=False,
                                                 n_negatives=args.negatives,
@@ -300,7 +368,9 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--domain", default="Software")
     ap.add_argument("--all-domains", action="store_true")
-    ap.add_argument("--arms", nargs="+", default=ARMS, choices=ARMS)
+    ap.add_argument("--arms", nargs="+", default=ARMS, choices=ALL_ARMS,
+                    help="'kd_adapter_holdout' is an ablation of arm C and needs "
+                         "--adapter-holdout-frac; it is not in the default set")
     ap.add_argument("--k", nargs="+", type=int, default=[0],
                     help=f"staleness in days; the M4 sweep is {STALENESS_DAYS}")
 
@@ -310,6 +380,18 @@ def main() -> None:
     ap.add_argument("--representation-dim", type=int, default=64)
     ap.add_argument("--tune-shared", action="store_true",
                     help="let shared embeddings keep training instead of freezing")
+
+    ap.add_argument("--adapter-holdout-frac", type=float, default=None,
+                    help=f"cuts the student window into an earlier fraction that "
+                         f"fits the adapter and a later remainder the student "
+                         f"trains on; required by 'kd_adapter_holdout' "
+                         f"(suggested: {ADAPTER_HOLDOUT_FRAC})")
+    ap.add_argument("--adapter-epochs", type=int, default=4,
+                    help="epochs to pretrain the adapter for 'kd_adapter_holdout'")
+    ap.add_argument("--train-window", choices=["student", "distill"], default="student",
+                    help="which slice non-holdout arms train on; set to 'distill' "
+                         "to give them the same (smaller) window as "
+                         "'kd_adapter_holdout' for a fair paired comparison")
 
     ap.add_argument("--teacher-epochs", type=int, default=2)
     ap.add_argument("--student-epochs", type=int, default=3)

@@ -129,6 +129,24 @@ def window_positions(
     return np.stack([user_idx[mask], pos[mask]], axis=1)
 
 
+def split_student_window(
+    bounds: tuple[pd.Timestamp, pd.Timestamp],
+    frac: float,
+) -> tuple[tuple[pd.Timestamp, pd.Timestamp], tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    Cut the student's window into an earlier and a later slice, chronologically.
+
+    Used by the adapter-holdout ablation (§6 of STATE.md): the earlier slice fits
+    the Student Adapter, the later slice is what the student actually trains on, so
+    the adapter's distillation target is never computed from data it was fit on. A
+    random split would not do — this task is causal, and the adapter is meant to
+    stand in for "the most recent ground truth", which is a temporal notion.
+    """
+    lo, hi = bounds
+    cut = lo + (hi - lo) * frac
+    return (lo, cut), (cut, hi)
+
+
 def staleness_windows(
     split_date: pd.Timestamp,
     stale_days: int,
@@ -217,6 +235,7 @@ def transfer_splits(
     valid_days: int = VALID_WINDOW_DAYS,
     eval_days: int = EVAL_WINDOW_DAYS,
     domains: list[str] | None = None,
+    adapter_holdout_frac: float | None = None,
 ) -> dict:
     """
     Everything a transfer run needs, already cut and already in one id space.
@@ -224,6 +243,11 @@ def transfer_splits(
     Returns the pooled data (so a model can be built from its vocabularies and
     feature table), the teacher's pooled positions, and the student's and
     evaluation positions restricted to one domain.
+
+    `adapter_holdout_frac`, when set, additionally cuts the student's window into
+    `adapter_fit` (the earlier fraction) and `distill` (the remainder) — see
+    `split_student_window`. Both are `None` otherwise, so every other arm and every
+    existing caller is unaffected.
     """
     pooled = pooled_cached(domains)
     if domain not in pooled.domain_names:
@@ -233,11 +257,19 @@ def transfer_splits(
                                student_days, teacher_days, valid_days, eval_days)
     cut = {name: window_positions(pooled, *bounds) for name, bounds in windows.items()}
 
+    if adapter_holdout_frac is not None:
+        fit_bounds, distill_bounds = split_student_window(
+            windows["student"], adapter_holdout_frac)
+        windows["adapter_fit"] = fit_bounds
+        windows["distill"] = distill_bounds
+        cut["adapter_fit"] = window_positions(pooled, *fit_bounds)
+        cut["distill"] = window_positions(pooled, *distill_bounds)
+
     def named(bounds) -> tuple[str | None, str]:
         lo, hi = bounds
         return (str(lo.date()) if lo is not None else None, str(hi.date()))
 
-    return {
+    result = {
         "pooled": pooled,
         "stale_days": stale_days,
         "windows": {k: named(v) for k, v in windows.items()},
@@ -248,6 +280,10 @@ def transfer_splits(
         "item_features": torch.from_numpy(pooled.item_features),
         "vocab_sizes": pooled.vocab_sizes,
     }
+    if adapter_holdout_frac is not None:
+        result["adapter_fit"] = domain_positions(pooled, cut["adapter_fit"], domain)
+        result["distill"] = domain_positions(pooled, cut["distill"], domain)
+    return result
 
 
 if __name__ == "__main__":

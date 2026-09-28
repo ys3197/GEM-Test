@@ -298,30 +298,49 @@ gap falls inside the noise.
 4 epochs, selection on `valid`, reported once on `eval`. Teacher alone on `eval`:
 **NE 0.5574**. `analysis/transfer_table.py` output:
 
-| arm | n | NE mean | spread | AUC | vs A | resolved? | params |
+| arm | n | NE mean | spread | AUC | paired Δ vs A | resolved? | params |
 |---|---|---|---|---|---|---|---|
 | **A** no transfer | 3 | 0.5883 | 0.0808 | 0.9172 | — | — | 91,333 |
 | **B** naive KD | 3 | 0.5658 | 0.0229 | 0.9270 | −3.83% | no | 91,333 |
 | **C** KD + Student Adapter | 3 | **0.7763** | 0.0296 | 0.9278 | **+31.95%** | **yes** | 92,311 |
-| **D** parameter sharing | 3 | 0.5277 | 0.0802 | 0.9338 | −10.31% | no | 91,333 |
+| **D** parameter sharing | 3 | 0.5277 | 0.0802 | 0.9338 | −10.31% | **yes** | 91,333 |
 | **E** representation transfer | 3 | 0.6357 | 0.0844 | 0.9299 | +8.05% | no | 165,253 |
 | **E'** shuffled control | 3 | 0.5677 | 0.0253 | 0.9190 | −3.50% | no | 165,253 |
 
-With three seeds instead of one or two, only **C's penalty is statistically resolved**
-— every other arm's gap vs A still sits inside the seed-noise band (§4.1). This
-sharpens, not changes, the 2-seed reading below: D's apparent −10% edge and B's −4%
-edge are not yet distinguishable from noise; C's +32% penalty is.
+`vs A` is a **paired** per-seed delta (`NE(arm, seed) − NE(A, seed)`, mean and spread
+taken over that per-seed series), not a comparison of independent unpaired ranges.
+This matters because every arm in a run shares that run's seed, teacher, and data with
+A — so the comparison that should be made is same-seed vs same-seed, and it has much
+more power than comparing each arm's raw-NE spread to A's raw-NE spread. Concretely:
+
+```
+paired delta per seed (42, 1337, 7), NE(arm) - NE(A):
+  B  naive KD       -0.0276  +0.0089  -0.0489   mixed sign  -> not resolved
+  C  KD+Adapter     +0.1802  +0.2174  +0.1663   same sign   -> resolved
+  D  param sharing  -0.0415  -0.0690  -0.0715   same sign   -> resolved
+  E  representation +0.0228  +0.1422  -0.0229   mixed sign  -> not resolved
+  E' shuffled       -0.0447  +0.0304  -0.0474   mixed sign  -> not resolved
+```
+
+D's raw NE overlaps A's raw NE (both have spread ~0.08, because A's own across-seed
+variance is large) — a naive "does the range overlap" check calls that noise. But
+paired by seed, D beats A in **all three individual seeds**, and the paired-delta
+spread (0.030) is far smaller than its mean (0.061). The unpaired check was throwing
+away the fact that A's high variance is largely a **shared, run-level** factor (same
+seed drives student init the same way across every arm in that run) — pairing cancels
+it. `analysis/transfer_table.py` was rewritten to report the paired comparison; the
+raw NE mean/spread columns are kept for description, not for the verdict.
 
 **Readings, descending confidence:**
 
-1. **C is 32% worse than no transfer, and — with 3 seeds — this is now the one
-   resolved result in the table**, not just a same-direction pattern. Hypothesis: the
-   adapter turns distillation from a regulariser into an *overfitting amplifier*. It
-   fits ground truth on the student's own training window and fits it better than the
-   student does (`adapter_fit` 0.096 against `task` 0.15), so the distillation target
-   becomes a high-fidelity copy of the training labels. At `k = 0` this is all cost —
-   the teacher is not stale, so there is nothing to correct and the training labels are
-   just relayed twice.
+1. **C is 32% worse than no transfer — resolved, and the effect is an order of
+   magnitude past the noise floor** (paired mean 0.188, paired spread 0.051).
+   Hypothesis: the adapter turns distillation from a regulariser into an *overfitting
+   amplifier*. It fits ground truth on the student's own training window and fits it
+   better than the student does (`adapter_fit` 0.096 against `task` 0.15), so the
+   distillation target becomes a high-fidelity copy of the training labels. At `k = 0`
+   this is all cost — the teacher is not stale, so there is nothing to correct and the
+   training labels are just relayed twice.
 
    **This is not evidence against claim B.** The claim is that C's advantage *widens
    with `k`*, so C at its worst when the teacher is current is the baseline the sweep
@@ -330,13 +349,18 @@ edge are not yet distinguishable from noise; C's +32% penalty is.
    training window the amplification is structural. **Untested — this is now the
    single open blocker before M4.** See §6.
 
-2. **E does not clearly beat its own shuffled control** (0.6357 vs 0.5677, both inside
-   noise). There is still no resolved evidence E transfers anything useful, and its
-   extra 74k parameters remain unearned.
+2. **D (parameter sharing) is resolved as better than no transfer, by ~6% NE, in all
+   three individual seeds** — this only became visible under the paired comparison; the
+   earlier (unpaired) 2-seed and 3-seed readings called it noise. It is also the
+   cheapest arm to run: copy four quantile-bucket embedding tables and freeze them,
+   matching the reason those four vocabularies were the only ones shared across
+   domains. **D should be carried into M4 as a resolved baseline, not a speculative
+   one.**
 
-3. **D and B's apparent edges over A did not hold up at n=3** — both are unresolved.
-   Worth re-checking at a larger seed count before treating parameter sharing as
-   "the cheap win"; the 2-seed read was premature.
+3. **B and E/E' stay unresolved even under the paired test** — their per-seed deltas
+   change sign across seeds, which is a materially different (weaker) situation than
+   D's, where the sign never flips. There is still no evidence B beats naive-A, or
+   that E transfers anything its own shuffled control doesn't.
 
 **NE and AUC disagree**, which matters because M4 rests on it: C keeps a respectable
 AUC (0.9278) while its NE collapses (0.7763); the *ranking* stays intact and the
@@ -383,6 +407,18 @@ on one part and train the student on the other, and see whether C's 30% penalty 
 version — otherwise M4 measures a self-inflicted wound at every `k`, which would mask
 the staleness effect it is looking for. **This is the single highest-value next
 experiment**, because it decides whether M4's C arm is even implemented correctly.
+
+**D (parameter sharing) is now a resolved baseline, not a speculative one** — §4.2 was
+re-read with a paired-by-seed comparison (same seed drives every arm's student init
+within a run, so pairing cancels a run-level noise source that dominated the old
+unpaired range comparison) and D beat no-transfer in all three individual seeds.
+`analysis/transfer_table.py` now reports this paired comparison by default. Worth
+tracking through M4 alongside C: D never touches the teacher's live predictions, so the
+open question is whether its ~6% edge is staleness-invariant (plausible — it is
+copying static bucket embeddings, not distilling from a moving target) or whether it
+degrades too. If it stays flat while C's gap over B widens with `k`, that is itself a
+clean illustration of claim B's premise: static parameter sharing addresses accuracy,
+not staleness.
 
 **M4 — the staleness sweep.** 4 domains × 5 `k` values × 6 arms × ≥3 seeds = 360 student
 runs plus 5 teachers. At ~60 s per student that is roughly 6–7 GPU-hours. Worth running

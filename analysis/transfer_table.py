@@ -19,6 +19,16 @@ that spread is reported as "not resolved", not as a result.
 
 This reads whatever `runs/transfer/*.json` holds and groups by (k, domain, arm), so
 it works the same for one seed or for five — it will just say so.
+
+`resolved?` is decided from **paired** per-seed deltas, not from comparing each arm's
+raw-NE spread against A's raw-NE spread. Every arm in a given run shares that run's
+seed, teacher, and data with every other arm, so `NE(arm, seed) - NE(A, seed)` cancels
+the run-level noise that dominates the raw NE (A alone moved 0.081 across three seeds
+in the first `Software`/`k=0` pass). A gap is `resolved` when the *paired* deltas agree
+in sign and their spread is smaller than their mean magnitude — a weaker, cheaper bar
+than a real significance test, but one that already recovered a real result the
+unpaired comparison was hiding: parameter sharing (arm D) beat no-transfer in all three
+individual seeds even though its raw-NE spread overlapped A's.
 """
 
 from __future__ import annotations
@@ -68,12 +78,12 @@ def summarise(rows: list[dict]) -> None:
         print(f"\n{domain}   k={k}d   teacher alone: NE {teacher:.4f}")
 
         header = (f"  {'arm':<26} {'n':>2}  {'NE mean':>8} {'spread':>8}  "
-                  f"{'AUC':>7}  {'vs A':>8}  {'resolved?':>10}  {'params':>8}")
+                  f"{'AUC':>7}  {'paired d':>9}  {'resolved?':>10}  {'params':>8}")
         print(header)
         print("  " + "-" * (len(header) - 2))
 
         base = grouped.get((k, domain, "vm_only"), [])
-        base_ne = np.array([r["ne"] for r in base]) if base else None
+        base_ne_by_seed = {r["seed"]: r["ne"] for r in base}
 
         for arm in ARMS:
             runs = grouped.get((k, domain, arm), [])
@@ -83,18 +93,23 @@ def summarise(rows: list[dict]) -> None:
             auc = np.mean([r["auc"] for r in runs])
             spread = ne.max() - ne.min() if len(ne) > 1 else float("nan")
 
-            if base_ne is None or arm == "vm_only":
+            if not base_ne_by_seed or arm == "vm_only":
                 delta, verdict = "", ""
             else:
-                gap = ne.mean() - base_ne.mean()
-                delta = f"{100 * gap / base_ne.mean():+7.2f}%"
-                # 判据：arm 之间的差必须超过两边各自的种子波动
-                noise = max(spread if len(ne) > 1 else 0.0,
-                            base_ne.max() - base_ne.min() if len(base_ne) > 1 else 0.0)
-                verdict = ("yes" if abs(gap) > noise else "no") if noise > 0 else "1 seed"
+                # 配对判据：同一 seed 内 arm 与 A 共享 teacher/data，噪声可以互相抵消
+                paired = np.array([r["ne"] - base_ne_by_seed[r["seed"]]
+                                    for r in runs if r["seed"] in base_ne_by_seed])
+                if len(paired) < 2:
+                    delta, verdict = "", "n<2 pairs"
+                else:
+                    mean_delta = paired.mean()
+                    paired_spread = paired.max() - paired.min()
+                    base_mean = np.mean(list(base_ne_by_seed.values()))
+                    delta = f"{100 * mean_delta / base_mean:+8.2f}%"
+                    verdict = "yes" if abs(mean_delta) > paired_spread else "no"
 
             print(f"  {ARM_LABELS[arm]:<26} {len(runs):>2}  {ne.mean():>8.4f} "
-                  f"{spread:>8.4f}  {auc:>7.4f}  {delta:>8}  {verdict:>10}  "
+                  f"{spread:>8.4f}  {auc:>7.4f}  {delta:>9}  {verdict:>10}  "
                   f"{runs[0]['trainable']:>8,}")
 
     n_seeds = len({r["seed"] for r in rows})

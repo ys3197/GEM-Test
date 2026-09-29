@@ -422,7 +422,48 @@ that tool groups by `(k, domain, arm)` without regard to training-window size, a
 would silently average these smaller-window runs together with the original
 full-window ones under the same `vm_only`/`kd_adapter` keys.
 
-### 4.3 M1 smoke test (claim A, for reference)
+### 4.3 M4 preliminary — `Software`, full `k` sweep, 3 seeds: the falsification criterion is met
+
+Before committing to the full 4-domain × 5-`k` × 6-arm grid (§6), §6's own plan called
+for checking whether the `k` trend exists at all on one domain first. It does, cleanly.
+`Software`, 3 seeds (42, 1337, 7), teacher-epochs 2, student-epochs 4 —
+`runs/transfer/m4_sw_s{42,1337,7}.json`.
+
+The falsification criterion from §6 is **C's gap over B must widen monotonically with
+`k`**. Computed as the paired per-seed advantage `NE(B, seed) − NE(C, seed)` (positive
+= C better):
+
+```
+k        C's paired advantage over B     spread    resolved?
+0             -21.05%                     0.0075       yes
+90             +2.23%                     0.0135       yes
+365            +9.81%                     0.0147       yes
+730           +20.68%                     0.0173       yes
+1095          +24.55%                     0.0744       yes
+```
+
+Every single point is individually resolved (paired spread well under the paired
+mean), and the direction never reverses: C goes from 21 points worse than B when the
+teacher is current to nearly 25 points better once the teacher is a full three years
+stale. This is the cleanest result the project has produced — the criterion set in
+advance, stated so it could not be moved later, is met on every one of five points.
+
+Two things this preliminary pass also settled without being the target:
+
+- **Naive KD (B) is independently confirmed harmed by staleness** — resolved worse
+  than no-transfer at `k = 730` (+17.42%) and `k = 1095` (+27.70%). The premise that
+  motivates arm C (a stale teacher's raw output degrades a student) is not just GEM's
+  claim, it is measured here.
+- **D (parameter sharing) stays resolved as beating no-transfer at every single `k`**
+  (−6% to −17%, no trend toward zero), consistent with §6's prediction that its edge
+  should be staleness-invariant since it never touches the teacher's live predictions.
+
+One domain, one part of the grid — this is not yet claim B "confirmed" the way M3's
+arm-C-at-`k=0` result was resolved on its own terms. But it is the strongest evidence
+the project has produced for it, and it clears the bar §6 set for proceeding to the
+full sweep.
+
+### 4.4 M1 smoke test (claim A, for reference)
 
 ```
 Software, 150k positions, 2 epochs, untuned, solo (not pooled)
@@ -477,18 +518,30 @@ clean illustration of claim B's premise: static parameter sharing addresses accu
 not staleness.
 
 **M4 — the staleness sweep.** 4 domains × 5 `k` values × 6 arms × ≥3 seeds = 360 student
-runs plus 5 teachers. At ~60 s per student that is roughly 6–7 GPU-hours. Worth running
-`Software` across all `k` at 3 seeds first (90 runs, ~1.5 h) to see whether the `k`
-trend exists at all before committing to the full grid.
+runs plus 5 teachers. At ~60 s per student that is roughly 6–7 GPU-hours.
+
+**The preliminary check is done and passed — see §4.3.** `Software` at 3 seeds cleared
+the falsification criterion (**C's gap over B must widen monotonically with `k`**) on
+every one of five points, all individually resolved. The remaining work is the other
+three domains (`Video_Games`, `Musical_Instruments`, `Industrial_and_Scientific`) at
+the same 3 seeds, to find out whether the trend is a property of the mechanism or a
+property of `Software` specifically:
 
 ```bash
-.venv/Scripts/python.exe -u train_transfer.py --domain Software \
-  --k 0 90 365 730 1095 --student-seed 42 --tag m4_sw_s42 > runs/m4_sw_s42.log 2>&1
+for d in Video_Games Musical_Instruments Industrial_and_Scientific; do
+  for s in 42 1337 7; do
+    .venv/Scripts/python.exe -u train_transfer.py --domain "$d" \
+      --k 0 90 365 730 1095 --teacher-epochs 2 --student-epochs 4 --student-seed $s \
+      --tag "m4_$(echo "$d" | tr 'A-Z' 'a-z')_s$s" \
+      > "runs/m4_$(echo "$d" | tr 'A-Z' 'a-z')_s$s.log" 2>&1
+  done
+done
 ```
 
-The falsification criterion, stated so it cannot be moved later: **claim B holds only
-if C's gap over B widens monotonically with `k`.** A flat or noisy relationship is a
-negative result and gets reported as one.
+Teachers are cross-domain (pooled), so the 5 teachers already cached from the
+`Software` pass are reused here — this is pure student-training cost, roughly the
+same wall-clock as the `Software` pass was (~2h, per the timestamps on
+`runs/m4_sw_s*.log`), not 3x it.
 
 **M5 — scaling law.** Five model sizes via `MiniGEMConfig.scaled`, NE against FLOPs.
 Not started. Note the constraint from arm D: `scaled()` moves `dim`, which breaks

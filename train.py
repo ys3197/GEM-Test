@@ -96,7 +96,7 @@ def evaluate(model: MiniGEM, loader: DataLoader, device: str) -> dict[str, float
     }
 
 
-def make_loaders(domain: str, args) -> tuple[DataLoader, DataLoader, dict, torch.Tensor]:
+def make_loaders(domain: str, args) -> tuple[DataLoader, DataLoader, DataLoader, dict, torch.Tensor]:
     data = load_domain(domain)
     splits = temporal_split(data, pd.Timestamp(args.train_end),
                             pd.Timestamp(args.valid_end))
@@ -114,16 +114,41 @@ def make_loaders(domain: str, args) -> tuple[DataLoader, DataLoader, dict, torch
     return (
         loader(splits["train"], True, args.max_train),
         loader(splits["valid"], False, args.max_valid),
+        loader(splits["test"], False, args.max_eval) if len(splits["test"]) else None,
         data.vocab_sizes,
         torch.from_numpy(data.item_features),
     )
+
+
+def count_flops(model: MiniGEM, batch: dict[str, torch.Tensor]) -> float:
+    """
+    Measured, not estimated: FLOPs/example for one forward+backward pass.
+
+    A hand-derived formula would have to track every matmul across the FM
+    stacks, the attention pooling, and the head separately, and get it wrong
+    silently. `FlopCounterMode` traces the actual ops instead — the same
+    measure-don't-guess standard the rest of this project holds itself to.
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+
+    was_training = model.training
+    model.train()
+    fc = FlopCounterMode(display=False)
+    with fc:
+        logits = model(batch)
+        loss = F.binary_cross_entropy_with_logits(logits, batch["label"])
+        loss.backward()
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+    return fc.get_total_flops() / len(batch["label"])
 
 
 def train(args) -> dict:
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     torch.manual_seed(args.seed)
 
-    train_loader, valid_loader, vocab_sizes, item_features = make_loaders(args.domain, args)
+    train_loader, valid_loader, eval_loader, vocab_sizes, item_features = make_loaders(
+        args.domain, args)
 
     cfg = MiniGEMConfig(variant=args.variant, dim=args.dim, n_layers=args.layers,
                         n_queries=args.queries, dropout=args.dropout)
@@ -133,13 +158,21 @@ def train(args) -> dict:
     model = MiniGEM(vocab_sizes, item_features, cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
+    flops_per_example = None
+    if args.flops:
+        probe_batch = next(iter(train_loader))
+        probe_batch = {k: v.to(device, non_blocking=True) for k, v in probe_batch.items()}
+        flops_per_example = count_flops(model, probe_batch)
+
     print(f"{args.domain} | {cfg.variant} | dim={cfg.dim} layers={cfg.n_layers} "
           f"M={cfg.n_queries}")
     print(f"params: {model.n_parameters / 1e6:.2f}M "
-          f"({model.n_dense_parameters / 1e6:.2f}M dense)")
+          f"({model.n_dense_parameters / 1e6:.2f}M dense)"
+          + (f"  |  {flops_per_example / 1e6:.2f}M FLOPs/example (fwd+bwd)"
+             if flops_per_example else ""))
     print(f"train batches: {len(train_loader):,}  valid batches: {len(valid_loader):,}\n")
 
-    history, best = [], {"ne": float("inf")}
+    history, best, best_state, seen_total = [], {"ne": float("inf")}, None, 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0, running, seen = time.time(), 0.0, 0
@@ -162,6 +195,7 @@ def train(args) -> dict:
                 print(f"  epoch {epoch} step {step:>6,}/{len(train_loader):,}  "
                       f"loss {running / seen:.4f}  {rate:,.0f} samples/s")
 
+        seen_total += seen
         metrics = evaluate(model, valid_loader, device)
         metrics.update(epoch=epoch, train_loss=running / seen,
                        seconds=round(time.time() - t0, 1))
@@ -171,6 +205,8 @@ def train(args) -> dict:
 
         if metrics["ne"] < best["ne"]:
             best = dict(metrics)
+            if eval_loader is not None:
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         elif args.early_stop:
             print("  NE stopped improving — early stop")
             break
@@ -180,9 +216,21 @@ def train(args) -> dict:
         "config": asdict(cfg),
         "params": model.n_parameters,
         "dense_params": model.n_dense_parameters,
+        "flops_per_example": flops_per_example,
+        "train_examples_seen": seen_total,
+        "train_flops": flops_per_example * seen_total if flops_per_example else None,
         "best": best,
         "history": history,
     }
+
+    # 用 valid 选出的那一版权重，在从未参与过选择的 test 窗口上只报一次——
+    # 否则更容易过拟合的大模型会在"哪个 epoch 最好"这个选择本身上占便宜，
+    # M3 已经踩过这个坑（见 STATE.md §3.4）。
+    if eval_loader is not None and best_state is not None:
+        model.load_state_dict(best_state)
+        result["eval"] = evaluate(model, eval_loader, device)
+        print(f"selected epoch {best['epoch']} (valid NE {best['ne']:.4f})  ->  "
+              f"eval NE {result['eval']['ne']:.4f}  AUC {result['eval']['auc']:.4f}")
 
     RUNS_DIR.mkdir(exist_ok=True)
     tag = args.tag or f"{args.domain}_{cfg.variant}_d{cfg.dim}_l{cfg.n_layers}"
@@ -215,6 +263,10 @@ def main() -> None:
     ap.add_argument("--max-train", type=int, default=None,
                     help="cap training positions — for smoke runs")
     ap.add_argument("--max-valid", type=int, default=50_000)
+    ap.add_argument("--max-eval", type=int, default=50_000,
+                    help="cap on the held-out window after --valid-end, used for "
+                         "a once-only report with the epoch selected on --valid; "
+                         "see train's eval_loader")
 
     ap.add_argument("--workers", type=int, default=0,
                     help="0 on Windows: the dataset holds large arrays that "
@@ -224,6 +276,9 @@ def main() -> None:
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--seed", type=int, default=RANDOM_SEED)
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--flops", action="store_true",
+                    help="measure FLOPs/example (fwd+bwd) via torch's FlopCounterMode "
+                         "— the M5 scaling-law x-axis")
 
     args = ap.parse_args()
     if not (PROCESSED_DIR / args.domain / "interactions.parquet").exists():

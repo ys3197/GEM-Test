@@ -25,7 +25,7 @@ a result.
 |---|---|---|---|
 | **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | **deferred** — see M1 |
 | **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Age the teacher deliberately: it trains on a sliding 730-day window ending at `T − k`, the student always on `[T − 365, T]`, both scored on `[T, T + 180]`. Sweep `k ∈ {0, 90, 365, 730, 1095}` days | **Supported at this scale** — see M4 |
-| **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 |
+| **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 done — **untested by this design**, see M5 |
 
 M3's three-seed pass on `Software` at `k = 0` was groundwork — it established the
 windows, the controls, and the noise floor, and — once compared by seed rather than by
@@ -434,6 +434,60 @@ python -m analysis.transfer_table --pattern "m4_*"
 
 ---
 
+## M5 — scaling law: overparameterization, not a scaling curve
+
+Five sizes via `MiniGEMConfig.scaled(factor)`, `factor ∈ {0.25, 0.5, 1, 2, 4}`, 3 seeds
+each, `Software` solo, a **fixed** 300k-position training budget across every size —
+holding data constant isolates capacity as the one thing changing, rather than mixing
+in a compute-optimal data/size question this project has no budget to answer. FLOPs
+are measured directly (`torch`'s `FlopCounterMode` tracing a real forward+backward
+pass), not estimated from a parameter-count formula. The epoch is selected on `valid`
+and reported once on a `test` window that was never part of selection — the same fix
+M3 needed applies here too, since the bigger sizes turned out to have far noisier
+training trajectories, which is exactly what that selection bias would have rewarded.
+
+```
+factor   dense params   FLOPs/example   valid NE (mean ± spread)   eval NE (mean ± spread)
+0.25          8,211         165,984      0.5325 ± 0.0190             0.6924 ± 0.0537
+0.5          63,013         888,512      0.4899 ± 0.0088             0.6254 ± 0.0204
+1.0         604,953       6,121,856      0.4998 ± 0.0166             0.6395 ± 0.0477
+2.0       6,922,609      55,059,200      0.4952 ± 0.0529             0.6611 ± 0.0853
+4.0      90,468,321     625,247,744      0.5753 ± 0.1808             0.7483 ± 0.2482
+```
+
+**This is not log-linear scaling.** A naive log-log fit gives `R² = 0.28` with the
+NE range across all five sizes (0.12) *smaller* than the largest single size's own
+seed spread (0.25, at the biggest size) — not resolved, by the same bar used
+everywhere else in this project. But the shape underneath the failed fit is
+informative on its own:
+
+1. **0.25 → 0.5 is a real, resolved gain** — the smallest model is genuinely
+   undersized, and giving it more capacity helps cleanly (both spreads under 0.02,
+   the gap between them roughly double either one).
+2. **0.5 through 2.0 is a flat plateau** — a 110x range in dense parameters (63k to
+   6.9M) lands within 0.01 NE of the same value. More capacity buys nothing
+   measurable in this range.
+3. **4.0 doesn't degrade uniformly — one seed collapses.** Two of three seeds sit
+   close to the 0.5–2.0 plateau; the third overfits within a single epoch and never
+   recovers. The mean and especially the ballooning spread (10x the 0.5-size spread)
+   are driven substantially by that one run.
+
+**Reading: this looks like overparameterization on a fixed, modest data budget, not
+evidence against genuine compute scaling.** 90.5M dense parameters against 300k
+training positions is a >300:1 ratio — precisely the regime where a fixed-data sweep
+cannot tell "the architecture doesn't benefit from scale" apart from "this much data
+cannot support this many parameters." `Software`'s solo training window has 1.06M
+positions available; only 300k were used here to keep the sweep bounded and fair
+across all five sizes. **Claim C is untested by this design, not falsified by it** —
+a real test needs training data to grow with model size (a compute-optimal,
+Chinchilla-style sweep), which would be a different script, not a rerun of this one.
+
+```bash
+python train_scaling.py --factors 0.25 0.5 1.0 2.0 4.0 --seeds 42 1337 7
+```
+
+---
+
 ## Setup
 
 ```bash
@@ -481,10 +535,12 @@ models/
   interformer.py            the two structures claim A compares
   gem.py                    assembly; one config drives every width
   transfer.py               the five FM-to-VM transfer arms
-train.py                    training loop, normalized entropy, AUC
+train.py                    training loop, normalized entropy, AUC; --flops, valid/eval split
 train_transfer.py           trains the pooled FM once, then five students from it
+train_scaling.py            M5: five sizes x seeds at a fixed data budget
 analysis/
   padding_waste.py          M0 result
+  transfer_table.py         cross-seed aggregation, paired-by-seed resolved?/no
 tests/                      causality and architecture guardrails — no GPU needed
 figures/                    committed — the README renders them
 ```

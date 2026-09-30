@@ -24,18 +24,17 @@ a result.
 | | Claim | How it is tested | Status |
 |---|---|---|---|
 | **A** | InterFormer's interleaved structure beats pool-then-interact, which "risks losing critical engagement signals" | Fix parameter count, swap only the structure, sweep depth | **deferred** — see M1 |
-| **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Age the teacher deliberately: it trains on a sliding 730-day window ending at `T − k`, the student always on `[T − 365, T]`, both scored on `[T, T + 180]`. Sweep `k ∈ {0, 90, 365, 730, 1095}` days | **M4 in progress** — `Software` passed the falsification test, 3 domains remain |
+| **B** | A **Student Adapter** — a light module that refines a teacher's outputs using fresh ground truth — beats naive knowledge distillation when the teacher is stale | Age the teacher deliberately: it trains on a sliding 730-day window ending at `T − k`, the student always on `[T − 365, T]`, both scored on `[T, T + 180]`. Sweep `k ∈ {0, 90, 365, 730, 1095}` days | **Supported at this scale** — see M4 |
 | **C** | Performance scales log-linearly with compute | Five model sizes, NE vs FLOPs | M5 |
 
 M3's three-seed pass on `Software` at `k = 0` was groundwork — it established the
 windows, the controls, and the noise floor, and — once compared by seed rather than by
 raw range — it resolved two effects: arm C (Student Adapter) hurts badly at `k = 0`,
-and arm D (parameter sharing) helps. M4's own preliminary pass then swept all five `k`
-values on `Software`, 3 seeds, and checked the criterion stated in advance: **C's gap
-over B must widen monotonically with `k`.** It does, on every one of five points, each
-individually resolved — see the M4 section below. What is left is the same sweep on
-the other three domains, to find out whether this is a property of the mechanism or of
-one domain.
+and arm D (parameter sharing) helps. M4 then swept all five `k` values on all four
+domains, 3 seeds each, and checked the criterion stated in advance: **C's gap over B
+must widen monotonically with `k`.** It does — on all 20 (domain, `k`) points, every
+one individually resolved, no reversals anywhere. See the M4 section below for the
+full table.
 
 **B is the centre of gravity**, and the reason claim A is deferred rather than next. A and
 C have close analogues in the public literature; the Student Adapter does not, and it is
@@ -376,52 +375,61 @@ on disk, with no new training runs.
 
 ---
 
-## M4 — the staleness sweep, first domain
+## M4 — the staleness sweep: claim B holds at this scale
 
-The full grid is 4 domains × 5 `k` values × 6 arms × 3 seeds. Before committing to all
-of it, the plan was to run one domain across every `k` first and check whether the
-trend exists at all. It does — cleanly, on every point.
+The full grid: 4 domains × 5 `k` values × 6 arms × 3 seeds, 60 student runs on top of
+M3's 18, all reusing `Software`'s 5 cached teachers (teachers are cross-domain/pooled,
+so nothing needed retraining per domain).
 
-`Software`, 3 seeds (42, 1337, 7), same training config as M3. The criterion, fixed in
-advance so it could not be moved after seeing the data: **C's gap over B must widen
-monotonically with `k`.** Computed as the paired per-seed advantage
-`NE(B, seed) − NE(C, seed)`, positive meaning C beats B:
+The criterion, fixed before any of this ran so it could not be moved after seeing the
+data: **C's gap over B must widen monotonically with `k`.** Computed as the paired
+per-seed advantage `100 · (NE(B, seed) − NE(C, seed)) / NE(B, seed)`, positive meaning
+C beats B, `*` marking a resolved point:
 
 ```
-k        C's paired advantage over B     resolved?
-0             -21.05%  (C far worse)        yes
-90             +2.23%                        yes
-365            +9.81%                        yes
-730           +20.68%                        yes
-1095          +24.55%                        yes
+domain                        k=0       k=90      k=365     k=730     k=1095
+Software                    −37.2%*    +3.9%*    +16.6%*   +29.9%*   +32.6%*
+Video_Games                 −20.8%*   +12.9%*    +26.8%*   +38.6%*   +42.0%*
+Musical_Instruments         −18.5%*   +10.3%*    +21.4%*   +25.1%*   +31.6%*
+Industrial_and_Scientific   −21.9%*   +16.2%*    +32.2%*   +38.5%*   +43.1%*
 ```
 
-Every point is individually resolved, and the direction never reverses: C goes from 21
-points worse than naive KD when the teacher is fresh to nearly 25 points better once
-the teacher is three years stale. This is the cleanest result in the project so far —
-a criterion stated before the run, met on all five points.
+**All 20 points are resolved, and every domain widens monotonically with no
+reversal.** C goes from roughly 20–37 points worse than naive KD when the teacher is
+fresh to 30–43 points better once it is three years stale, on every domain tested.
+This is the project's central result: a criterion stated in advance, met cleanly
+across the whole grid — not just the one domain checked preliminarily.
 
-Two things fell out of this pass without being the target. **Naive KD is independently
-confirmed harmed by staleness** — arm B is resolved worse than no-transfer at `k = 730`
-(+17.4%) and `k = 1095` (+27.7%), so the premise the whole mechanism rests on (a stale
-teacher's raw output degrades a student) is measured here, not assumed. And
-**parameter sharing (D) stays resolved as beating no-transfer at every `k`** (−6% to
-−17%, no trend toward zero) — consistent with it never touching the teacher's live
-predictions, so nothing about staleness should move it.
+*(An earlier revision of this section reported these numbers as raw NE-unit deltas
+with a `%` sign attached, e.g. "−21.05%" for `Software` at `k = 0` where the correctly
+normalized figure is −37.2%. Direction and monotonicity were right; the magnitude
+label was not. Caught while extending to the other three domains.)*
 
-One domain is not the full claim — the other three (`Video_Games`,
-`Musical_Instruments`, `Industrial_and_Scientific`) still need the same sweep to know
-whether this is a property of the mechanism or of `Software` specifically. But it
-clears the bar this preliminary pass was for.
+Two secondary checks turned out more domain-dependent than the `Software`-only pass
+suggested — worth stating plainly rather than repeating the cleaner single-domain read:
+
+- **Naive KD's harm is staleness-specific only in `Software`.** There, B is resolved
+  worse than no-transfer starting at `k = 730`, not before — matching the premise that
+  a *stale* teacher's output specifically degrades a student. In the other three
+  domains, B is resolved worse than no-transfer at **every** `k`, including `k = 0`:
+  naive KD is just generally worse there, not because of staleness. This doesn't
+  threaten the main criterion (about the *gap* between B and C), but it means that
+  particular story doesn't generalize past one domain.
+- **Parameter sharing (D)'s clean, every-`k`-resolved edge was also `Software`-specific.**
+  It stays in the right direction (beats no-transfer) in every cell of the grid, but is
+  only resolved at zero to two of five `k` values in the other three domains. Downgrade
+  from "resolved, staleness-invariant baseline" to "usually right direction, rarely
+  resolved outside one domain."
 
 ```bash
-for d in Video_Games Musical_Instruments Industrial_and_Scientific; do
+for d in Software Video_Games Musical_Instruments Industrial_and_Scientific; do
   for s in 42 1337 7; do
     python train_transfer.py --domain "$d" --k 0 90 365 730 1095 \
       --teacher-epochs 2 --student-epochs 4 --student-seed $s \
       --tag "m4_$(echo "$d" | tr 'A-Z' 'a-z')_s$s"
   done
 done
+python -m analysis.transfer_table --pattern "m4_*"
 ```
 
 ---

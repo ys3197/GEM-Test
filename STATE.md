@@ -69,7 +69,7 @@ Three claims, current status:
 | | claim | status |
 |---|---|---|
 | **A** | InterFormer's interleaved structure beats pool-then-interact | **deferred** — see §5 |
-| **B** | A Student Adapter beats naive KD when the teacher is stale | M3 built, **M4 pending** |
+| **B** | A Student Adapter beats naive KD when the teacher is stale | **M4 done — supported at this scale**, see §4.3 |
 | **C** | Quality scales log-linearly with compute | M5, not started |
 
 **B is the centre of gravity.** A and C have close analogues in public literature; the
@@ -422,46 +422,71 @@ that tool groups by `(k, domain, arm)` without regard to training-window size, a
 would silently average these smaller-window runs together with the original
 full-window ones under the same `vm_only`/`kd_adapter` keys.
 
-### 4.3 M4 preliminary — `Software`, full `k` sweep, 3 seeds: the falsification criterion is met
+### 4.3 M4 — full 4-domain, 5-`k`, 3-seed sweep: claim B holds at this scale
 
-Before committing to the full 4-domain × 5-`k` × 6-arm grid (§6), §6's own plan called
-for checking whether the `k` trend exists at all on one domain first. It does, cleanly.
-`Software`, 3 seeds (42, 1337, 7), teacher-epochs 2, student-epochs 4 —
-`runs/transfer/m4_sw_s{42,1337,7}.json`.
+All four domains, all five `k` values, 3 seeds each (42, 1337, 7), teacher-epochs 2,
+student-epochs 4 — `runs/transfer/m4_{sw,video_games,musical_instruments,
+industrial_and_scientific}_s{42,1337,7}.json`, 60 student runs total (this section) on
+top of the 18 from M3.
 
-The falsification criterion from §6 is **C's gap over B must widen monotonically with
-`k`**. Computed as the paired per-seed advantage `NE(B, seed) − NE(C, seed)` (positive
-= C better):
+**Correction to the previous revision of this section.** The `Software`-only
+preliminary pass reported "C's paired advantage over B" as the raw per-seed NE
+difference with a `%` sign appended (e.g. "−21.05%"), which is not a percentage of
+anything — it is an NE-unit delta. The numbers below are recomputed correctly as
+`100 · (NE(B, seed) − NE(C, seed)) / NE(B, seed)`, averaged and spread over seeds. The
+direction and monotonicity of the original finding were right; the magnitudes were not
+labeled correctly. Caught while extending the analysis to the other three domains,
+before this went anywhere but STATE.md/README.
+
+The falsification criterion from §6, fixed before any of this ran: **C's gap over B
+must widen monotonically with `k`.**
 
 ```
-k        C's paired advantage over B     spread    resolved?
-0             -21.05%                     0.0075       yes
-90             +2.23%                     0.0135       yes
-365            +9.81%                     0.0147       yes
-730           +20.68%                     0.0173       yes
-1095          +24.55%                     0.0744       yes
+C's paired advantage over B (positive = C beats B), * = resolved
+
+domain                        k=0       k=90      k=365     k=730     k=1095
+Software                    −37.2%*    +3.9%*    +16.6%*   +29.9%*   +32.6%*
+Video_Games                 −20.8%*   +12.9%*    +26.8%*   +38.6%*   +42.0%*
+Musical_Instruments         −18.5%*   +10.3%*    +21.4%*   +25.1%*   +31.6%*
+Industrial_and_Scientific   −21.9%*   +16.2%*    +32.2%*   +38.5%*   +43.1%*
 ```
 
-Every single point is individually resolved (paired spread well under the paired
-mean), and the direction never reverses: C goes from 21 points worse than B when the
-teacher is current to nearly 25 points better once the teacher is a full three years
-stale. This is the cleanest result the project has produced — the criterion set in
-advance, stated so it could not be moved later, is met on every one of five points.
+**All 20 points are resolved, and every domain widens monotonically with no
+reversal.** This is the project's central result: the criterion was fixed in advance,
+stated so it could not be moved after seeing data, and it is met cleanly across the
+entire grid, not just the one domain checked preliminarily. **Claim B is supported at
+this scale.**
 
-Two things this preliminary pass also settled without being the target:
+Two secondary checks, run alongside the main criterion, turned out more domain-dependent
+than the `Software`-only pass suggested:
 
-- **Naive KD (B) is independently confirmed harmed by staleness** — resolved worse
-  than no-transfer at `k = 730` (+17.42%) and `k = 1095` (+27.70%). The premise that
-  motivates arm C (a stale teacher's raw output degrades a student) is not just GEM's
-  claim, it is measured here.
-- **D (parameter sharing) stays resolved as beating no-transfer at every single `k`**
-  (−6% to −17%, no trend toward zero), consistent with §6's prediction that its edge
-  should be staleness-invariant since it never touches the teacher's live predictions.
+```
+B (naive KD) vs A, * = resolved-harmful          D (parameter sharing) vs A, * = resolved-better
+              k=0    k=90   k=365   k=730  k=1095            k=0     k=90    k=365   k=730   k=1095
+Software     −3.6%   −2.0%   +0.9% +17.8%* +28.0%*   Software −10.4%* −17.3%*  −6.4%*  −9.8%* −11.2%*
+Video_Games +29.7%* +23.4%* +21.8%* +42.0%* +48.9%*  V_Games   −6.1%   −7.4%   −7.4%*  −5.8%*  −5.1%
+Musical_I.  +20.7%* +16.3%* +19.0%* +24.8%* +36.9%*  Music_I.  −2.0%   −1.2%*  −1.7%   −1.7%   −1.9%
+Industrial  +44.1%* +32.0%* +38.5%* +47.1%* +56.4%*  Industr.  −3.3%   −3.2%   −2.7%   −2.7%   −2.2%
+```
 
-One domain, one part of the grid — this is not yet claim B "confirmed" the way M3's
-arm-C-at-`k=0` result was resolved on its own terms. But it is the strongest evidence
-the project has produced for it, and it clears the bar §6 set for proceeding to the
-full sweep.
+- **Naive KD's harm is staleness-specific only in `Software`** — resolved harmful
+  starting at `k = 730`, not before. In the other three domains, B is resolved harmful
+  at *every* `k`, including `k = 0`. So "a stale teacher's raw output degrades a
+  student" (the premise motivating arm C) is not what's shown in those three domains —
+  naive KD is just generally worse than no-transfer there, staleness or not. This
+  doesn't threaten the main criterion (which is about the *gap* between B and C, not
+  B's absolute pattern), but it means the clean staleness-specific story from
+  `Software` alone does not generalize, and should not be repeated as if it does.
+- **D's resolved, staleness-invariant edge was also specific to `Software`.** In the
+  other three domains the edge is much smaller (1–7%) and resolved at only one or two
+  `k` values each (`Video_Games` at 365/730, `Musical_Instruments` at 90, never in
+  `Industrial_and_Scientific`). Direction is consistently negative (D beats A) in every
+  cell, but most of that is inside the noise band. §6's "D is a resolved baseline" read
+  was premature outside `Software` — downgrade to "usually the right direction, rarely
+  resolved elsewhere."
+
+The lesson repeated here is the project's own: a clean result on one domain is a
+hypothesis about the other three, not a finding about them.
 
 ### 4.4 M1 smoke test (claim A, for reference)
 
@@ -505,43 +530,32 @@ adapter's learned correction is simply a worse distillation target than the raw
 teacher when there is nothing stale to correct, which is exactly what the `k` sweep
 below is positioned to test.
 
-**D (parameter sharing) is now a resolved baseline, not a speculative one** — §4.2 was
-re-read with a paired-by-seed comparison (same seed drives every arm's student init
-within a run, so pairing cancels a run-level noise source that dominated the old
-unpaired range comparison) and D beat no-transfer in all three individual seeds.
-`analysis/transfer_table.py` now reports this paired comparison by default. Worth
-tracking through M4 alongside C: D never touches the teacher's live predictions, so the
-open question is whether its ~6% edge is staleness-invariant (plausible — it is
-copying static bucket embeddings, not distilling from a moving target) or whether it
-degrades too. If it stays flat while C's gap over B widens with `k`, that is itself a
-clean illustration of claim B's premise: static parameter sharing addresses accuracy,
-not staleness.
+**D (parameter sharing)'s resolved-baseline status was `Software`-specific, not
+general** — see §4.3's second table. It stays in the right direction (beats A) in
+every cell of the full grid, but is only resolved in `Software` at every `k`; in the
+other three domains it is resolved at zero to two of five `k` values each. Not
+staleness-invariant in any way that's been measured cleanly outside one domain — just
+usually a small, cheap, plausibly-real edge.
 
-**M4 — the staleness sweep.** 4 domains × 5 `k` values × 6 arms × ≥3 seeds = 360 student
-runs plus 5 teachers. At ~60 s per student that is roughly 6–7 GPU-hours.
+**M4 — the staleness sweep. Done, for the main criterion.** 4 domains × 5 `k` values ×
+6 arms × 3 seeds = 60 student runs, on top of M3's 18, all on `Software`'s 5 cached
+teachers reused across domains (teachers are pooled/cross-domain, so no retraining was
+needed). See §4.3 for the full readout.
 
-**The preliminary check is done and passed — see §4.3.** `Software` at 3 seeds cleared
-the falsification criterion (**C's gap over B must widen monotonically with `k`**) on
-every one of five points, all individually resolved. The remaining work is the other
-three domains (`Video_Games`, `Musical_Instruments`, `Industrial_and_Scientific`) at
-the same 3 seeds, to find out whether the trend is a property of the mechanism or a
-property of `Software` specifically:
+**Claim B is supported at this scale.** The falsification criterion fixed in §6 before
+any of this ran — C's gap over B must widen monotonically with `k` — is met on all 20
+(domain, `k`) points, every one individually resolved, no reversals anywhere. This is
+the project's headline result. What is *not* yet shown: that the mechanism holds at
+more than 3 seeds per cell, or on a different data source than Amazon Reviews, or past
+`k = 1095`. Those are extensions, not the next required step — the criterion set in
+advance has been met.
 
-```bash
-for d in Video_Games Musical_Instruments Industrial_and_Scientific; do
-  for s in 42 1337 7; do
-    .venv/Scripts/python.exe -u train_transfer.py --domain "$d" \
-      --k 0 90 365 730 1095 --teacher-epochs 2 --student-epochs 4 --student-seed $s \
-      --tag "m4_$(echo "$d" | tr 'A-Z' 'a-z')_s$s" \
-      > "runs/m4_$(echo "$d" | tr 'A-Z' 'a-z')_s$s.log" 2>&1
-  done
-done
-```
-
-Teachers are cross-domain (pooled), so the 5 teachers already cached from the
-`Software` pass are reused here — this is pure student-training cost, roughly the
-same wall-clock as the `Software` pass was (~2h, per the timestamps on
-`runs/m4_sw_s*.log`), not 3x it.
+Remaining housekeeping before calling M4 finished:
+- Update the claims table's status for **B** from "M4 in progress" to done, with the
+  headline numbers.
+- A figure for the `k` sweep (M6, below) — the table in §4.3 is correct but a plot
+  would make the monotonic widening visible at a glance, which is the whole point of
+  the result.
 
 **M5 — scaling law.** Five model sizes via `MiniGEMConfig.scaled`, NE against FLOPs.
 Not started. Note the constraint from arm D: `scaled()` moves `dim`, which breaks

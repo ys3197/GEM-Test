@@ -360,11 +360,18 @@ has a respectable AUC of 0.9278 and an NE of 0.7763; the *ranking* is intact and
 *calibration* is what collapsed — the exact split claim B's premise depends on, showing
 up in real measurements rather than as an argument.
 
+![six arms compared, Software, k=0](figures/m3_arm_comparison.png)
+
+Blue bars are resolved (the gap clears the seed spread); red bars are not. C's
+damage and D's edge are the only two that are — visible at a glance as the only bars
+whose error whiskers don't cross zero.
+
 ```bash
 python -m data.transfer_data                       # reproduces the window table above
 python train_transfer.py --domain Software --k 0 --student-seed 42
 python -m analysis.transfer_table                  # mean, spread, and resolved?/no
 python train_transfer.py --all-domains --k 0 90 365 730 1095    # the M4 sweep
+python -m analysis.transfer_figures                 # both figures on this page
 ```
 
 `transfer_table` decides `resolved?` from the paired per-seed deltas, not from
@@ -399,6 +406,12 @@ reversal.** C goes from roughly 20–37 points worse than naive KD when the teac
 fresh to 30–43 points better once it is three years stale, on every domain tested.
 This is the project's central result: a criterion stated in advance, met cleanly
 across the whole grid — not just the one domain checked preliminarily.
+
+![C's advantage over naive KD widens with staleness, all four domains](figures/m4_k_sweep.png)
+
+Four lines, one per domain, none of them flat and none of them crossing back below
+zero after `k ≈ 90` — the error bars are the paired seed spread, and every one of
+them clears the axis before the next point does.
 
 *(An earlier revision of this section reported these numbers as raw NE-unit deltas
 with a `%` sign attached, e.g. "−21.05%" for `Software` at `k = 0` where the correctly
@@ -541,6 +554,7 @@ train_scaling.py            M5: five sizes x seeds at a fixed data budget
 analysis/
   padding_waste.py          M0 result
   transfer_table.py         cross-seed aggregation, paired-by-seed resolved?/no
+  transfer_figures.py       M3/M4 figures, from data already on disk
 tests/                      causality and architecture guardrails — no GPU needed
 figures/                    committed — the README renders them
 ```

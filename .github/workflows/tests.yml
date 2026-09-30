@@ -1,0 +1,35 @@
+name: tests
+
+# The 44 guardrails under tests/ need no GPU and skip cleanly without downloaded
+# data (see tests/__init__.py and STATE.md Sec2) - exactly the ones written after
+# two silent causality bugs (a timestamp-unit mismatch, tie-leakage in the sample
+# builder) reached results before anything caught them. Running them on every push
+# is cheap insurance against a repeat.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # CPU-only build - tests need no GPU, and the CUDA build is large and
+          # unnecessary here (see requirements.txt's own note on this split).
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v

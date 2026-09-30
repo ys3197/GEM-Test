@@ -605,13 +605,6 @@ more than 3 seeds per cell, or on a different data source than Amazon Reviews, o
 `k = 1095`. Those are extensions, not the next required step — the criterion set in
 advance has been met.
 
-Remaining housekeeping before calling M4 finished:
-- Update the claims table's status for **B** from "M4 in progress" to done, with the
-  headline numbers.
-- A figure for the `k` sweep (M6, below) — the table in §4.3 is correct but a plot
-  would make the monotonic widening visible at a glance, which is the whole point of
-  the result.
-
 **M5 — done, but the design couldn't support the claim.** See §4.4: five sizes at a
 fixed 300k-position data budget showed a real gain from 0.25→0.5, a flat plateau from
 0.5 through 2.0, and a collapse at 4.0 dominated by one catastrophic seed — not a
@@ -629,8 +622,15 @@ the likely outcome is a null result about *this data* rather than about the stru
 To make it conclusive it needs the 12% dense-parameter gap closed first. The README
 states this as a choice rather than an omission.
 
-**M6 — README polish, figures for M3/M4, CI.** The README already carries M0/M1/M3;
-what is missing is a figure for the `k` sweep and for the arm comparison.
+**M6 — mostly done.** `analysis/transfer_figures.py` produces both figures from data
+already on disk (no retraining): `figures/m3_arm_comparison.png` (six arms at `k=0`,
+resolved vs not, colour-coded) and `figures/m4_k_sweep.png` (C's advantage over B
+across all four domains and every `k` — the monotonic widening made visible). Both are
+embedded in the README. What's left: **CI** — the 44-test suite (`tests/`, no GPU
+needed, skips cleanly without data) isn't wired into anything; a GitHub Actions
+workflow running `pytest` on push would catch a regression before it reaches a
+result, which is exactly the kind of silent failure this project has hit before
+(the timestamp bug, the tie-leakage bug, both caught by tests written after the fact).
 
 ---
 
@@ -661,6 +661,7 @@ train_scaling.py            M5: five sizes x seeds, fixed data budget, log-log f
 analysis/
   padding_waste.py          M0 figure
   transfer_table.py         cross-seed aggregation with resolved?/no
+  transfer_figures.py       M3/M4 figures - reads runs/transfer/*.json, no retraining
 tests/                      44 guardrails, no GPU needed, skip cleanly without data
 runs/                       gitignored - checkpoints, logs, result JSON
 figures/                    committed, the README renders them
